@@ -1,5 +1,6 @@
 #!/bin/bash
 # 自动重试 push：连不上 GitHub 时反复试，成功即退出 0
+# 注意：历史已做脱敏重写，必须 --force 覆盖远端
 # 用法: ./_push_retry.sh [最多尝试次数] [间隔秒]
 cd "$(dirname "$0")" || exit 2
 
@@ -13,7 +14,7 @@ for i in $(seq 1 "$MAX"); do
   # 连不上就别傻等，60s 超时 + 低速 15s 断开
   out=$(GIT_TERMINAL_PROMPT=0 timeout 90 \
         git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 \
-        push origin HEAD 2>&1)
+        push --force origin HEAD:main 2>&1)
   rc=$?
   echo "$out" >> "$LOG"
   if [ $rc -eq 0 ]; then

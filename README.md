@@ -30,9 +30,16 @@
 # 1. 装依赖（幂等，缺什么装什么，失败自动切 npmmirror）
 sh install_mineflayer.sh
 
-# 2. 配置模型（不进版本库）
+# 2. 配置模型与连接信息（都不进版本库）
 cat > llm.json <<'EOF'
 { "base": "https://api.example.com/v1", "model": "your-model", "key": "sk-..." }
+EOF
+
+cat > mc.env <<'EOF'
+MC_HOST=你的服务器地址
+MC_PORT=25565
+MC_NAME=bot名字
+MC_PW=登录密码
 EOF
 
 # 3. 启动
@@ -45,15 +52,18 @@ python3 mc_bridge.py   # 另开一个进程，负责“说话”和“思考”
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MC_HOST` / `MC_PORT` | `mc.example.com` / `25565` | 服务器地址 |
+| `MC_HOST` / `MC_PORT` | —（必填） / `25565` | 服务器地址，写在 `mc.env`，`start.sh` 自动加载 |
 | `MC_VER` | `1.21.11` | 协议版本 |
-| `MC_NAME` / `MC_PW` | `xiaoice_bot` / — | 离线身份与登录密码 |
+| `MC_NAME` / `MC_PW` | `xiaoice_bot` / — | 离线身份与登录密码（同样放 `mc.env`） |
 | `MC_AUTO` / `MC_AUTO_MS` | `1` / `600000` | 自主行动开关与决策间隔（最小 60s） |
 | `MC_HEAP_SOFT` / `MC_HEAP_HARD` | 400MB / 700MB | 内存软线（清理 GC）、硬线（优雅重启） |
 | `MC_GC_TRIM` | 220MB | 到这个量先收一遍 GC |
 | `MC_AUTOHARVEST` | `1` | 盖房时是否顺路采集材料 |
 | `MC_FORCE_SURVIVAL` | `1` | 上线若被切成冒险模式，自动 `/gamemode survival` |
 | `MC_USAGE_KEEP_DAYS` | `90` | token 账本保留天数（`<=0` 永不清理） |
+
+> 隐私：`mc.env`、`llm.json`、日志、token 账本等一律在 `.gitignore` 里，仓库里只留占位值；
+> 缺 `MC_HOST` 时脚本会直接报错退出，不会悄悄连去别的地方。
 
 ## 游戏内怎么用
 

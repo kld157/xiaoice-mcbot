@@ -2,11 +2,12 @@
 /** where.js — 处理 EasyAuth 注册/登录，报出当前位置后退出 */
 const mineflayer = require('mineflayer');
 
-const HOST = process.env.MC_HOST || 'mc.example.com';
+// 连接参数一律走环境变量：真实值放同目录 mc.env（已被 .gitignore 忽略）
+const HOST = process.env.MC_HOST || '';
 const PORT = parseInt(process.env.MC_PORT || '25565', 10);
 const VER = process.env.MC_VER || '1.21.11';
 const NAME = process.env.MC_NAME || 'xiaoice_bot';
-const PW = process.env.MC_PW || 'REDACTED_PW';
+const PW = process.env.MC_PW || '';
 
 const log = [];
 const L = (s) => log.push(s);

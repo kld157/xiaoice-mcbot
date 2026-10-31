@@ -8,7 +8,9 @@ const byState = md.blocksByStateId || {};
 console.log(`原版 1.21.11: ${md.blocksArray.length} 种方块, ${VANILLA_MAX + 1} 个 state (0..${VANILLA_MAX})`);
 
 const bot = mineflayer.createBot({
-  host: 'mc.example.com', port: 25565, username: 'xiaoice_bot',
+  host: process.env.MC_HOST || '',
+  port: parseInt(process.env.MC_PORT || '25565', 10),
+  username: process.env.MC_NAME || 'xiaoice_bot',
   version: '1.21.11', auth: 'offline', hideErrors: true, checkTimeoutInterval: 15000,
 });
 

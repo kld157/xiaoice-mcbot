@@ -3,6 +3,12 @@
 cd "$(dirname "$0")" || exit 1
 
 # 和 start.sh 保持一致：5 分钟决策 + 内存红线（watchdog 兜底重启时也不能丢）
+# 真实连接参数（服务器地址/账号密码）放 mc.env，不进仓库
+if [ -f ./mc.env ]; then
+  set -a; . ./mc.env; set +a
+elif [ -f "$(dirname "$0")/mc.env" ]; then
+  set -a; . "$(dirname "$0")/mc.env"; set +a
+fi
 MC_AUTO_MS=${MC_AUTO_MS:-300000}; export MC_AUTO_MS
 MC_HEAP_SOFT=${MC_HEAP_SOFT:-419430400}; export MC_HEAP_SOFT
 MC_HEAP_HARD=${MC_HEAP_HARD:-734003200}; export MC_HEAP_HARD

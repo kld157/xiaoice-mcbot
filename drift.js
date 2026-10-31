@@ -12,7 +12,8 @@ const fs = require('fs');
 const path = require('path');
 const mineflayer = require('mineflayer');
 
-const HOST = process.env.MC_HOST || 'mc.example.com';
+// 连接参数一律走环境变量：真实值放同目录 mc.env（已被 .gitignore 忽略）
+const HOST = process.env.MC_HOST || '';
 const PORT = parseInt(process.env.MC_PORT || '25565', 10);
 const VER = process.env.MC_VER || '1.21.11';
 const NAME = process.env.MC_NAME || 'xiaoice_bot';

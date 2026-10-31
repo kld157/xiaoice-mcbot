@@ -1,6 +1,13 @@
 #!/bin/sh
 # start.sh — 安全启动/重启 play.js（不误杀自己）
 cd "$(dirname "$0")" || exit 1
+# 真实连接参数（服务器地址/账号密码）放 mc.env，不进仓库
+if [ -f ./mc.env ]; then
+  set -a; . ./mc.env; set +a
+elif [ -f "$(dirname "$0")/mc.env" ]; then
+  set -a; . "$(dirname "$0")/mc.env"; set +a
+fi
+
 # 自主决策间隔：5 分钟
 MC_AUTO_MS=300000
 export MC_AUTO_MS

@@ -687,7 +687,57 @@ function findSite(pos, half) {
   return null;
 }
 
-// 走位：不用寻路，直接"朝目标按住前进"，卡住就跳/横挪
+// —— 真寻路（pathfinder）：能绕坑、能垫一格高，避免"前方没地面就原地不动" ——
+let MOVE_CACHE = null;
+function buildMovements() {
+  if (!bot) return null;
+  if (MOVE_CACHE && MOVE_CACHE.entity === undefined) { /* 故意留空 */ }
+  try {
+    if (MOVE_CACHE) return MOVE_CACHE;
+    const mv = new Movements(bot);
+    mv.canDig = false;            // 别为了走路顺手把人家房子拆了
+    mv.allow1by1towers = true;    // 一格一格垫上去
+    mv.allowParkour = true;
+    mv.canOpenDoors = true;
+    mv.maxDropDown = 3;
+    mv.allowSprinting = false;
+    MOVE_CACHE = mv;
+    return mv;
+  } catch (e) { log('buildMovements err ' + (e.message || e)); return null; }
+}
+function resetMovements() { MOVE_CACHE = null; }
+
+async function pathWalk(tp, dist, timeout, opts = {}) {
+  if (!bot || !bot.entity || !bot.pathfinder) return false;
+  const off = opts.raw === true ? 0 : 0.5;
+  const dyTol = isFinite(opts.dyTol) ? opts.dyTol : 2.2;
+  const tx = tp.x + off, ty = tp.y + off, tz = tp.z + off;
+  const reached = () => {
+    if (!bot || !bot.entity) return false;
+    const me = bot.entity.position;
+    return Math.hypot(tx - me.x, tz - me.z) <= dist && Math.abs(ty - me.y) <= dyTol;
+  };
+  if (reached()) return true;
+  let ok = false;
+  try {
+    const mv = buildMovements();
+    if (mv) bot.pathfinder.setMovements(mv);
+    bot.pathfinder.setGoal(new goals.GoalNear(tx, ty, tz, Math.max(1, Math.round(dist))));
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      if (!bot || !bot.entity) break;
+      if (reached()) { ok = true; break; }
+      await Promise.race([bot.waitForTicks(2), sleep(800)]);   // 断线时 waitForTicks 会卡死，兜个底
+
+    }
+  } catch (e) {
+    log('pathWalk err ' + tp.x + ',' + tp.y + ',' + tp.z + ' ' + (e.message || e));
+  }
+  try { bot.pathfinder.setGoal(null); bot.pathfinder.stop(); } catch (e) {}
+  return ok;
+}
+
+// 走位：① 先试真寻路；② 不行再退回"朝目标按住前进"，卡住就跳/横挪
 async function walkTo(tp, dist = 2.6, timeout = 6000, opts = {}) {
   if (!tp || !isFinite(tp.x) || !isFinite(tp.y) || !isFinite(tp.z)) {
     log('walkTo reject bad coord ' + JSON.stringify(tp && { x: tp.x, y: tp.y, z: tp.z }));
@@ -697,9 +747,21 @@ async function walkTo(tp, dist = 2.6, timeout = 6000, opts = {}) {
   // raw=true：tp 是实体坐标（不要 +0.5）；方块坐标才需要 +0.5 对到格心
   const off = opts.raw === true ? 0 : 0.5;
   const dyTol = isFinite(opts.dyTol) ? opts.dyTol : 2.2;
+  const reached = () => {
+    if (!bot || !bot.entity) return true;
+    const me = bot.entity.position;
+    return Math.hypot(tp.x + off - me.x, tp.z + off - me.z) <= dist && Math.abs(tp.y - me.y) <= dyTol;
+  };
+  if (reached()) return;
+  if (opts.path !== false) {
+    const budget = Math.max(1200, Math.min(6000, timeout - 900));
+    if (await pathWalk(tp, dist, budget, opts)) return;
+    if (reached()) return;
+  }
+  const deadline = t0 + timeout;
   let lastP = null, stuck = 0, side = 0;
   try {
-    while (Date.now() - t0 < timeout) {
+    while (Date.now() < deadline) {
       if (!bot || !bot.entity) break;
       const me = bot.entity.position;
       const dx = tp.x + off - me.x, dz = tp.z + off - me.z;
@@ -708,17 +770,22 @@ async function walkTo(tp, dist = 2.6, timeout = 6000, opts = {}) {
       if (d <= dist && Math.abs(dy) <= dyTol) break;
       if (d < 1e-6) break;
       await bot.look(Math.atan2(-dx, -dz), 0, true);
-      let ground = true;
+      let ground = true, waterAhead = false;
       try {
-        const ax = Math.floor(me.x + (dx / d) * 1.2), az = Math.floor(me.z + (dz / d) * 1.2);
+        const ax = Math.floor(me.x + (dx / d) * 1.0), az = Math.floor(me.z + (dz / d) * 1.0);
         const fy = Math.floor(me.y);
         ground = false;
-        for (let k = 0; k <= 2; k++) {
+        for (let k = 0; k <= 3; k++) {
           const b = bot.blockAt(new Vec3(ax, fy - k, az));
-          if (b && b.boundingBox !== 'empty') { ground = true; break; }
+          if (!b) continue;
+          if (/water|lava/.test(b.name)) { waterAhead = true; break; }
+          if (b.boundingBox !== 'empty') { ground = true; break; }
         }
       } catch (e) {}
-      bot.setControlState('forward', ground && d > dist + 0.6);
+      // 拆出来的坑/台阶：脚还踩着地、目标就在下面两三格，就别杵着不动了，迈过去试试
+      const canStep = !waterAhead && (ground || (bot.entity.onGround && dy > -3.2 && dy < 2.2));
+      bot.setControlState('forward', canStep && d > dist + 0.6);
+
       bot.setControlState('sprint', !!opts.sprint);
       bot.setControlState('jump', !!(bot.entity.onGround && (dy > 0.8 || stuck > 0)));
       if (stuck === 1) { side = side ? -1 : 1; bot.setControlState(side > 0 ? 'left' : 'right', true); }
@@ -1002,6 +1069,28 @@ let actBusy = false;
 
 function actRegister(name, run) { ACTIONS[name] = run; }
 
+// 只读：列出附近实体，重点标出能吃的动物（food=0 时找吃的最快）
+actRegister('mobs', async (a) => {
+  if (!bot || !bot.entity) throw new Error('还没进游戏');
+  const R = Number((a && a.range) || 64);
+  const EDIBLE = ['cow', 'pig', 'sheep', 'chicken', 'rabbit', 'mooshroom', 'mushroom_cow', 'hoglin'];
+  const out = [];
+  for (const id in bot.entities) {
+    const e = bot.entities[id];
+    if (!e || !e.position || e.type === 'player' || e.type === 'object' || isItemDrop(e)) continue;
+    const d = e.position.distanceTo(bot.entity.position);
+    if (d > R) continue;
+    out.push({ name: e.name || '?', kind: e.type, dist: +d.toFixed(1), pos: [Math.round(e.position.x), Math.round(e.position.y), Math.round(e.position.z)], edible: EDIBLE.indexOf(e.name) >= 0 });
+  }
+  out.sort((x, y) => x.dist - y.dist);
+  const edible = out.filter((o) => o.edible);
+  return {
+    ok: true,
+    msg: edible.length ? `附近能吃的动物：${edible.slice(0, 6).map((o) => o.name + '(' + o.dist + 'm)').join('、')}` : `附近 ${R} 格内没有可吃动物（其它实体 ${out.length} 个）`,
+    extra: { edible: edible.slice(0, 10), ents: out.slice(0, 20) },
+  };
+});
+
 function writeActResult(id, name, ok, msg, extra) {
   const rec = { id: String(id), name, ok: !!ok, msg: String(msg || '').slice(0, 300), ts: Date.now(), extra: extra || null };
   try { fs.writeFileSync(ACT_OUT, JSON.stringify(rec), 'utf8'); } catch (e) {}
@@ -1097,8 +1186,10 @@ actRegister('follow', (a) => {
 });
 actRegister('stop', () => {
   if (BUILD.active) BUILD.abort = true;    // 只有在建房时才置中止，别污染后续 collect/dig
+  const wasPvp = PVP.active ? PVP.name : null;
+  if (PVP.active) endPvp('stopped');
   stopFollow();
-  return { ok: true, msg: '停下了', extra: { building: BUILD.active } };
+  return { ok: true, msg: wasPvp ? `停下了，也跟 ${wasPvp} 收手了` : '停下了', extra: { building: BUILD.active, pvp: wasPvp } };
 });
 // 手动叫它重连：跟服务器脱节时最省事的一招（不用再 kill 进程）
 actRegister('resync', (a) => {
@@ -1107,6 +1198,12 @@ actRegister('resync', (a) => {
   return { ok, msg: ok ? '好，我断线重连一下，回来说话' : '这会儿不方便重连（刚连过）' };
 });
 // 只读内窥镜：查各种全局忙/卡标志，别再靠猜（10-31 pickup 捡不动、collect 挖 0 块的排查）
+actRegister('block', (a) => {
+  const p = new Vec3(Math.floor(+a.x), Math.floor(+a.y), Math.floor(+a.z));
+  const b = bot.blockAt(p);
+  if (!b) return { ok: false, msg: '那格还没加载', extra: { pos: [p.x, p.y, p.z] } };
+  return { ok: true, msg: `(${p.x},${p.y},${p.z}) = ${b.name}`, extra: { name: b.name, box: b.boundingBox, pos: [p.x, p.y, p.z] } };
+});
 actRegister('flags', () => ({
   ok: true,
   msg: 'flags',
@@ -1116,6 +1213,7 @@ actRegister('flags', () => ({
     pos: bot && bot.entity ? bot.entity.position.toString() : '?',
     pickupBusy, pickupLastAgo: Date.now() - pickupLast,
     combat: COMBAT ? { active: COMBAT.active, target: COMBAT.target && COMBAT.target.name, coolAgo: Date.now() - (COMBAT.cool || 0) } : null,
+    pvp: { active: PVP.active, vs: PVP.name, skill: 'L' + PVP.skill + ' ' + PVP.cfg.name, stopHp: PVP.stopHp, hits: PVP.hits, whiffs: COMBAT.whiffs || 0, leftMs: PVP.active ? PVP.until - Date.now() : 0 },
     build: { active: BUILD.active, abort: BUILD.abort, abortQuiet: BUILD.abortQuiet, placed: BUILD.placed, failed: BUILD.failed },
     following: !!followTarget, followName: followTarget && followTarget.username, followLeftMs: followUntil - Date.now(),
     plugActive: typeof PLUG !== 'undefined' ? PLUG.active : null,
@@ -2106,6 +2204,155 @@ const ENTER_HP = 13;           // 血没回满前不主动接新架
 const COMBAT = { active: false, target: null, since: 0, lastAtk: 0, lastSay: 0, kills: 0, stuck: 0, lastPos: null, cool: 0 };
 let lastHp = null, fleeing = false;
 
+// ---------- 友好对打（PVP）----------
+// 只跟玩家"打着玩"：血到手软的线就停手认输，不挖方块追人，对手一消失立刻收手。
+// 档位 1 菜鸟 → 5 不留余力：攻速/暴击/走位/失误率/认输线全都跟着变
+const PVP_SKILLS = {
+  1: { name: '菜鸟',     atkCd: 1500, crit: false, strafeMs: 1200, miss: 0.35, sprintFrom: 99, stopHp: 12, backstep: 0.35 },
+  2: { name: '轻松',     atkCd: 1000, crit: false, strafeMs: 900,  miss: 0.15, sprintFrom: 6,  stopHp: 10, backstep: 0.12 },
+  3: { name: '正常',     atkCd: 620,  crit: true,  strafeMs: 550,  miss: 0.03, sprintFrom: 4,  stopHp: 8,  backstep: 0 },
+  4: { name: '认真',     atkCd: 600,  crit: true,  strafeMs: 400,  miss: 0,    sprintFrom: 3,  stopHp: 6,  backstep: 0 },
+  5: { name: '不留余力', atkCd: 590,  crit: true,  strafeMs: 300,  miss: 0,    sprintFrom: 2,  stopHp: 4,  backstep: 0, eatAt: 15 },
+};
+function normalizeSkill(v, fallback) {
+  const NAMES = {
+    'l1': 1, '菜鸟': 1, '新手': 1, 'rookie': 1, 'noob': 1,
+    'l2': 2, '轻松': 2, 'easy': 2, 'casual': 2,
+    'l3': 3, '正常': 3, '普通': 3, 'normal': 3,
+    'l4': 4, '认真': 4, 'serious': 4, 'hard': 4,
+    'l5': 5, '全力': 5, '不留余力': 5, 'full': 5, 'max': 5,
+  };
+  let s = Number(String(v == null ? '' : v).replace(/^l/i, ''));   // 支持 "L3" / "3"
+  if (!Number.isFinite(s) || s === 0) {
+    const k = String(v == null ? '' : v).trim();
+    s = NAMES[k.toLowerCase()] || NAMES[k] || 0;
+  }
+  s = Math.round(s);
+  if (!(s >= 1 && s <= 5)) s = fallback || 3;
+  return s;
+}
+
+const PVP = { active: false, target: null, name: null, until: 0, stopHp: 8, hits: 0, since: 0, skill: 3, cfg: PVP_SKILLS[3], minDist: Infinity };
+
+// ---------- 公平开局：有 OP 就"双方各发一份"，没 OP 就谁都别用 ----------
+// 跟人打着玩之前先把牌面拉平，别拿一身 buff 欺负人家。
+const opPending = new Set();
+function opCmd(cmd, ms = 2600) {
+  const OK = /Given|Gave|给予|已给|效果|Applied|Success|Done|success/i;
+  const BAD = /No permission|do not have|permission|无权|权限|Unknown command|未知的命令|未知命令|not found|找不到|Unknown or incomplete|no space|背包已满|full/i;
+  return new Promise((resolve) => {
+    let settled = false;
+    const w = {
+      check(t) {
+        if (settled) return false;
+        if (BAD.test(t)) { finish({ ok: false, msg: t.slice(0, 90) }); return true; }
+        if (OK.test(t)) { finish({ ok: true, msg: t.slice(0, 90) }); return true; }
+        return false;
+      },
+    };
+    const finish = (r) => { if (settled) return; settled = true; clearTimeout(timer); opPending.delete(w); resolve(r); };
+    const timer = setTimeout(() => finish({ ok: true, msg: 'no-reply' }), ms);
+    opPending.add(w);
+    try { bot.chat(cmd); } catch (e) { finish({ ok: false, msg: String((e && e.message) || e) }); }
+  });
+}
+function opCheckMessage(t) {
+  if (!opPending.size) return false;
+  for (const w of opPending) { if (w.check(t)) return true; }
+  return false;
+}
+
+const FAIR_BUFF = { gapples: 2, effects: [['speed', 45, 1], ['strength', 45, 0]] };
+
+// 双方同款同量：金苹果 N 个 + 同样的药水效果。第一条顺利才继续，别刷一堆报错。
+async function fairStart(target, opt) {
+  const o = Object.assign({}, FAIR_BUFF, opt || {});
+  const nm = String(target.username);
+  const gave = [];
+  const T = 1600;   // 服务器多半不回执，等太久纯浪费时间；no-reply 按"已发出"算
+  const efNote = o.effects.map((e) => `${e[0]}${e[2] ? '+' + e[2] : ''}`).join('/');
+  // 第一发既是探权限，也是对手的那份 buff
+  const first = o.effects.length
+    ? `/effect give ${nm} ${o.effects[0][0]} ${o.effects[0][1]} ${o.effects[0][2]} true`
+    : `/give ${nm} enchanted_golden_apple ${o.gapples}`;
+  const probe = await opCmd(first, T + 600);
+  log(`FAIR probe ${first} -> ${probe.ok ? 'ok' : 'FAIL'} ${probe.msg}`);
+  if (!probe.ok) return { ok: false, msg: probe.msg || '没权限', gave };
+  gave.push({ who: nm, act: o.effects.length ? 'effect' : 'give', ef: o.effects.length ? o.effects[0][0] : undefined, item: o.effects.length ? undefined : 'enchanted_golden_apple', ok: true });
+
+  // 剩下的对手那份 + 我自己那份并行发，省时间
+  const job = (who, cmd, tag) => opCmd(cmd, T).then((r) => Object.assign({ who, cmd, ok: r.ok, msg: r.msg }, tag));
+  const jobs = [];
+  if (Number(o.gapples) > 0) {
+    jobs.push(job(nm, `/give ${nm} enchanted_golden_apple ${o.gapples}`, { act: 'give', item: 'enchanted_golden_apple', n: o.gapples }));
+    jobs.push(job(NAME, `/give ${NAME} enchanted_golden_apple ${o.gapples}`, { act: 'give', item: 'enchanted_golden_apple', n: o.gapples }));
+  }
+  for (let i = 0; i < o.effects.length; i++) {
+    const [ef, secs, amp] = o.effects[i];
+    if (i > 0) jobs.push(job(nm, `/effect give ${nm} ${ef} ${secs} ${amp} true`, { act: 'effect', ef }));
+    jobs.push(job(NAME, `/effect give ${NAME} ${ef} ${secs} ${amp} true`, { act: 'effect', ef }));
+  }
+  const res = await Promise.all(jobs);
+  for (const r of res) {
+    gave.push(r);
+    log(`FAIR ${r.who} ${r.act}${r.ef ? ' ' + r.ef : ''}${r.item ? ' ' + r.item : ''} -> ${r.ok ? 'ok' : 'FAIL'} ${r.msg || ''}`);
+  }
+  const bads = gave.filter((g) => !g.ok);
+  return {
+    ok: bads.length === 0,
+    msg: bads.length === 0
+      ? `双方各发金苹果×${o.gapples} + ${efNote}`
+      : `发了但有 ${bads.length} 条没吃住：${bads.map((g) => g.who + ':' + (g.ef || g.item)).join(',')}`,
+    gave,
+  };
+}
+
+// 自己啃一个金苹果（附魔优先），吃完把武器换回来
+async function eatGapple() {
+  if (!bot || !bot.entity) return false;
+  const list = bot.inventory.items();
+  const g = list.find((it) => /enchanted_golden_apple/.test(it.name)) || list.find((it) => /golden_apple/.test(it.name));
+  if (!g) { log('EAT no golden apple in inventory'); return false; }
+  try {
+    await bot.equip(g, 'hand');
+    await bot.activateItem();
+    await bot.waitForTicks(45);
+    return true;
+  } catch (e) { return false; } finally { try { await equipBestWeapon(); } catch (e) {} }
+}
+
+function findPlayer(name) {
+  if (!bot || !bot.entity) return null;
+  const want = String(name || '').replace(/^@/, '').trim().toLowerCase();
+  let best = null, bd = Infinity;
+  for (const id in bot.entities) {
+    const e = bot.entities[id];
+    if (!e || e === bot.entity || !e.position || e.isValid === false) continue;
+    if (e.type !== 'player') continue;
+    const n = String(e.username || '');
+    if (!n || n === bot.username) continue;
+    if (want && !n.toLowerCase().includes(want)) continue;
+    const d = e.position.distanceTo(bot.entity.position);
+    if (d < bd) { bd = d; best = e; }
+  }
+  return best;
+}
+
+function isPvpTarget(e) { return !!(PVP.active && e && e === PVP.target); }
+
+function endPvp(why) {
+  if (!PVP.active) return;
+  const nm = PVP.name;
+  PVP.active = false;
+  PVP.target = null;
+  if (COMBAT.target && COMBAT.target.type === 'player') {
+    COMBAT.active = false; COMBAT.target = null; COMBAT.cool = Date.now() + 1200;
+  }
+  try { bot.clearControlStates(); } catch (e) {}
+  log('PVP end vs ' + (nm || '?') + ' why=' + (why || ''));
+  if (nm) PVP.lastName = nm;
+}
+
 function mobName(e) { return String((e && e.name) || '').replace(/^(minecraft:)/, ''); }
 
 function hostiles(r) {
@@ -2515,6 +2762,16 @@ setInterval(() => {
   if (!ready || !bot || !bot.entity || bot.health === undefined) return;
 
   let t = COMBAT.target;
+  if (t && isPvpTarget(t) && (t.isValid === false || !t.position)) {
+    const nm = PVP.name || '对手';
+    log('PVP target disappeared ' + nm);
+    endPvp('target_gone');
+    if (Date.now() - (COMBAT.lastSay || 0) > 8000) {
+      COMBAT.lastSay = Date.now();
+      llmSay(`${nm} 跟我比划两下就跑没影了，${sceneNow()}。轻松调侃一句，别说得难听，短。`);
+    }
+    return;
+  }
   if (t && (t.isValid === false || !t.position)) {
     if (COMBAT.active && Date.now() - COMBAT.lastAtk < 3000) {   // 刚捶过就没了 = 打死了
       COMBAT.kills++;
@@ -2567,12 +2824,17 @@ setInterval(() => {
   const hp = bot.health;
   const me = bot.entity.position;
   const dist = me.distanceTo(t.position);
+  const pvpCfg = isPvpTarget(t) ? PVP.cfg : null;   // PVP 档位：1 菜鸟 → 5 不留余力
 
   // 打不过的：躲
   if (NO_FIGHT.test(n) && dist < 10) { endCombat('avoid ' + n); fleeFrom(t); return; }
-  // 血少：先撤，能跑就跑
-  if (hp <= FLEE_HP) { endCombat('low hp'); COMBAT.cool = Date.now() + 4000; fleeFrom(t); return; }
-  if (hp <= 13 && bot.food < 18) eatSomething();
+  // 血少：先撤，能跑就跑；PVP 时到自己定的认输线就原地收手，别一路追着人打
+  const lowLine = isPvpTarget(t) ? Math.min(PVP.stopHp, FLEE_HP + 4) : FLEE_HP;
+  if (hp <= lowLine) {
+    if (isPvpTarget(t)) { endPvp('low_hp'); return; }
+    endCombat('low hp'); COMBAT.cool = Date.now() + 4000; fleeFrom(t); return;
+  }
+  if (hp <= (pvpCfg && pvpCfg.eatAt ? pvpCfg.eatAt : 13) && bot.food < 18) eatSomething();
 
   // 朝向：看眼睛高度（末影人不能盯，已经进 NO_FIGHT 了）
   const aim = t.position.offset(0, (t.height || 1.6) * 0.75, 0);
@@ -2586,7 +2848,7 @@ setInterval(() => {
       bot.setControlState('jump', false);
       const below = dy < -1.6;                   // 怪在下面
       const canDig = below && !COMBAT.descending && (COMBAT.digTry || 0) < 3
-        && n !== 'creeper' && bot.health >= 13 && dist < 10;
+        && n !== 'creeper' && bot.health >= 13 && dist < 10 && !isPvpTarget(t);   // 跟人打不挖方块掀地板
       if (canDig) {                              // 在下面：挖台阶下去打，别站在上面干瞪眼
         COMBAT.digTry = (COMBAT.digTry || 0) + 1;
         COMBAT.descending = true;
@@ -2615,7 +2877,7 @@ setInterval(() => {
     }
     try { bot.look(Math.atan2(-dx, -dz), 0, true); } catch (e) {}
     bot.setControlState('forward', true);
-    bot.setControlState('sprint', dist > 4);
+    bot.setControlState('sprint', dist > (pvpCfg ? pvpCfg.sprintFrom : 4));
     const moved = COMBAT.lastPos ? me.distanceTo(COMBAT.lastPos) : 1;
     COMBAT.lastPos = me.clone();
     if (moved < 0.06) COMBAT.stuck++; else COMBAT.stuck = 0;
@@ -2640,19 +2902,25 @@ setInterval(() => {
   }
 
   // 一边打一边侧移，别当沙包站着挨揍
-  if (Date.now() - (COMBAT.strafeAt || 0) > 550) {
+  if (Date.now() - (COMBAT.strafeAt || 0) > (pvpCfg ? pvpCfg.strafeMs : 550)) {
     COMBAT.strafeAt = Date.now();
     const s1 = Math.random() < 0.5 ? 'left' : 'right';
     bot.setControlState(s1, true);
     setTimeout(() => { try { bot.setControlState(s1, false); } catch (e) {} }, 260);
   }
 
-  if (Date.now() - COMBAT.lastAtk >= ATK_CD) {
+  if (Date.now() - COMBAT.lastAtk >= (pvpCfg ? pvpCfg.atkCd : ATK_CD)) {
     COMBAT.lastAtk = Date.now();
+    // 低档位"装菜"：手一滑，这一刀挥空
+    if (pvpCfg && pvpCfg.miss > 0 && Math.random() < pvpCfg.miss) {
+      COMBAT.whiffs = (COMBAT.whiffs || 0) + 1;
+      log('PVP whiff L' + PVP.skill + ' (' + (COMBAT.whiffs) + ')');
+      return;
+    }
     // 跳起来下落那一下是暴击（×1.5），血多的怪值得等一等
     const v = bot.entity.velocity ? bot.entity.velocity.y : 0;
     const tHp = (t.health !== undefined ? t.health : 20);
-    const wantCrit = tHp > 6 && COMBAT.critNext !== false;
+    const wantCrit = pvpCfg ? (pvpCfg.crit && tHp > 6) : (tHp > 6 && COMBAT.critNext !== false);
     if (wantCrit && bot.entity.onGround) {
       bot.setControlState('jump', true);
       setTimeout(() => { try { bot.setControlState('jump', false); } catch (e) {} }, 120);
@@ -2663,6 +2931,7 @@ setInterval(() => {
           if (bot.entity.position.distanceTo(COMBAT.target.position) > REACH + 0.4) return;
           bot.lookAt(COMBAT.target.position.offset(0, (COMBAT.target.height || 1.6) * 0.75, 0), true);
           bot.attack(COMBAT.target, true);
+          if (isPvpTarget(COMBAT.target)) PVP.hits++;
           lastActivity = Date.now();
         } catch (e) {}
       }, 300);
@@ -2670,6 +2939,16 @@ setInterval(() => {
     }
     COMBAT.critNext = true;
     try { bot.attack(t, true); } catch (e) { try { bot.attack(t); } catch (e2) {} }
+    if (isPvpTarget(t)) {
+      PVP.hits++;
+      // 菜鸟档：砍完自己退半步（像被反弹了似的）
+      if (pvpCfg && pvpCfg.backstep > 0 && Math.random() < pvpCfg.backstep) {
+        try {
+          bot.setControlState('back', true);
+          setTimeout(() => { try { bot.setControlState('back', false); } catch (e) {} }, 200);
+        } catch (e) {}
+      }
+    }
     lastActivity = Date.now();
   }
 }, 150);
@@ -2684,6 +2963,8 @@ function create() {
   });
 
   bot.loadPlugin(pathfinder);
+  resetMovements();   // 新连接 → Movements 得跟着新 bot 重建
+
 
   // —— 断流哨兵：官方 keepalive 超时是 120s，太晚了；45s 一个包都没收到就主动重连 ——
   let lastPkt = Date.now(), lastKa = Date.now(), kaGapLogged = false;
@@ -2709,6 +2990,7 @@ function create() {
   bot.on('message', (m) => {
     const t = strip(m.toString());
     if (!t) return;
+    if (opCheckMessage(t)) return;   // 正在等 OP 指令回执（给东西/上效果），先别当闲聊处理
     if (process.env.MSGDBG) log('MSG> ' + t.slice(0, 180));
     if (/registerRequired|Use \/register/i.test(t) && !registered) {
       registered = true;
@@ -3724,6 +4006,56 @@ async function _craftPlan(name, count, opts) {
   return invCountOf(name) >= want;
 }
 
+// 钓鱼：food=0 又没动物时唯一稳定食源（井里有水就行）
+actRegister('fish', async (a) => {
+  if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };
+  const casts = Math.max(1, Math.min(12, parseInt((a && a.casts) || 3, 10) || 3));
+  const limit = Math.max(8000, Math.min(60000, parseInt((a && a.timeout) || 25000, 10) || 25000));
+  const rod = bot.inventory.items().find((i) => /fishing_rod$/.test(i.name));
+  if (!rod) return { ok: false, msg: '没有钓竿，先 craft fishing_rod（3 木棍 + 2 线）' };
+  const W = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 24 });
+  if (!W) return { ok: false, msg: '附近 24 格内没找到水，钓不了' };
+  if (bot.entity.position.distanceTo(W.position) < 3) {
+    // 站太近就往上/旁边挪一格，免得浮标糊自己一脸
+    const back = bot.entity.position.offset(0, 0, 0);
+    void back;
+  }
+  await bot.equip(rod, 'hand').catch(() => {});
+  await bot.lookAt(W.position.offset(0.5, 0.5, 0.5), true).catch(() => {});
+  let got = [];
+  let errs = [];
+  for (let i = 0; i < casts; i++) {
+    const before = invCountOf('cod') + invCountOf('salmon') + invCountOf('tropical_fish') + invCountOf('pufferfish');
+    try {
+      await Promise.race([
+        bot.fish(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('等太久没咬钩')), limit)),
+      ]);
+    } catch (e) {
+      errs.push(String((e && e.message) || e).slice(0, 40));
+      await new Promise((r) => setTimeout(r, 800));
+      await bot.lookAt(W.position.offset(0.5, 0.5, 0.5), true).catch(() => {});
+      continue;
+    }
+    const after = invCountOf('cod') + invCountOf('salmon') + invCountOf('tropical_fish') + invCountOf('pufferfish');
+    if (after > before) got.push(after - before);
+    if (bot.heldItem == null || !/fishing_rod$/.test(bot.heldItem.name)) {
+      const r2 = bot.inventory.items().find((i) => /fishing_rod$/.test(i.name));
+      if (r2) await bot.equip(r2, 'hand').catch(() => {});
+    }
+    await new Promise((r) => setTimeout(r, 600));
+  }
+  const total = got.reduce((x, y) => x + y, 0);
+  const kinds = bot.inventory.items().filter((i) => /^(cod|salmon|tropical_fish|pufferfish)$/.test(i.name)).map((i) => i.name + 'x' + i.count);
+  return {
+    ok: total > 0,
+    msg: total > 0
+      ? `钓上来 ${total} 条鱼（${kinds.join('、')}）`
+      : `抛了 ${casts} 竿一条没上来：${errs.slice(0, 2).join(' / ') || '没鱼咬钩'}`,
+    extra: { total, kinds, casts, errs: errs.slice(0, 4), water: [Math.round(W.position.x), Math.round(W.position.y), Math.round(W.position.z)] },
+  };
+});
+
 actRegister('craft', async (a) => {
   const name = String((a && (a.item || a.name || a.thing)) || '').trim().toLowerCase().replace(/\s+/g, '_');
   const count = Math.max(1, Math.min(64, parseInt((a && a.count) || 1, 10) || 1));
@@ -3827,6 +4159,8 @@ const AUTO_MENU_LIST = [
   ['collect', '在附近采集能当砖的方块，args: {count}'],
   ['pickup', '把附近的掉落物捡了'],
   ['eat', '吃点背包里的东西垫肚子'],
+  ['mobs', '列附近实体/动物（找吃的、找怪都用它），args: {range:64}'],
+  ['fish', '在附近水里钓鱼（需要钓竿），args: {casts:3, timeout:25000}'],
   ['chest', '存/取/看箱子（清背包唯一有效的办法，toss 会被服务器回滚），args: {mode:"store|take|list", items:[...], preset:"junk", chest:"箱子名"}。给个新名字会自动新放一个箱子并记住坐标，比如 chest:"vault" 当保险箱'],
   ['armor', '换上背包里最好的护甲'],
   ['craft', '搓东西（木板/木棍/工作台/工具武器都行），args: {item:"英文id", count}；没工作台会自己搓一张摆上'],
@@ -4049,6 +4383,104 @@ actRegister('attack', async (a) => {
   };
 });
 
+// 跟玩家"打着玩"：pv p 一场不会往死里打，血到 stopHp 就认输收手
+actRegister('pvp', async (a) => {
+  if (!ready || !bot || !bot.entity) return { ok: false, msg: '还没进服呢' };
+  const skill = normalizeSkill(a.skill != null ? a.skill : a.level, 3);
+  const cfg = PVP_SKILLS[skill];
+  const secs = Math.max(6, Math.min(120, Number(a.secs || 30)));
+  const stopHp = a.stopHp != null ? Math.max(4, Math.min(16, Number(a.stopHp))) : cfg.stopHp;
+  const t = findPlayer(a.player || a.name || '');
+  if (!t) {
+    return { ok: false, msg: a.player ? `没看到 ${a.player}，他大概不在线或不在这附近` : '附近没别的玩家可以打' };
+  }
+  const nm = String(t.username || '对手');
+  const d0 = t.position.distanceTo(bot.entity.position);
+  if (d0 > 40) return { ok: false, msg: `${nm} 离我 ${d0.toFixed(0)} 格，太远啦，打不着` };
+  if (bot.health <= stopHp) return { ok: false, msg: `我血只剩 ${Math.round(bot.health)}，先让我回回血吧` };
+  if (PVP.active) return { ok: false, msg: `我正在跟 ${PVP.name} 比划呢` };
+
+  PVP.active = true; PVP.target = t; PVP.name = nm;
+  PVP.skill = skill; PVP.cfg = cfg;
+  PVP.stopHp = stopHp; PVP.until = Date.now() + secs * 1000;
+  PVP.since = Date.now(); PVP.hits = 0; PVP.minDist = d0;
+
+  COMBAT.cool = 0; fleeing = false;
+  COMBAT.target = t; COMBAT.active = true; COMBAT.since = Date.now();
+  COMBAT.stuck = 0; COMBAT.lastPos = null; COMBAT.digTry = 0; COMBAT.descending = false;
+  COMBAT.lastAtk = 0; COMBAT.whiffs = 0;
+  stopFollow();
+  try { await equipBestWeapon(); } catch (e) {}
+  log(`PVP start vs ${nm} L${skill}(${cfg.name}) dist=${d0.toFixed(1)} secs=${secs} stopHp=${stopHp} hp=${Math.round(bot.health)}`);
+  const defSay = {
+    1: `${nm} 来嘛来嘛，我可菜了，你让让我～`,
+    2: `${nm} 过两招！我尽量轻点`,
+    3: `${nm} 来呀来呀，手轻点哦～`,
+    4: `${nm} 认真了，别怪我啊`,
+    5: `${nm} 那我可不留余力了！`,
+  }[skill];
+  say(a.say != null ? String(a.say).slice(0, 180) : defSay);
+
+  // 公平开局：默认双方各发一份（金苹果 ×N + 同款药水效果）；没 OP 就谁都不上 buff
+  let fair = { ok: null, msg: '没开 buff' };
+  const fairOff = a.fair === false || a.buff === false
+    || String(a.buff || '').toLowerCase() === 'off' || String(a.fair || '').toLowerCase() === 'off';
+  if (!fairOff) {
+    const fopt = {};
+    if (a.gapples != null) fopt.gapples = Math.max(0, Math.min(16, parseInt(a.gapples, 10) || 0));
+    if (Array.isArray(a.effects) && a.effects.length) {
+      const okEf = a.effects.filter((e) => Array.isArray(e) && e[0])
+        .map((e) => [String(e[0]).replace(/^minecraft:/, ''), Math.max(1, Math.min(600, Number(e[1]) || 45)), Math.max(0, Math.min(4, Number(e[2]) || 0))]);
+      if (okEf.length) fopt.effects = okEf;
+    }
+    try { fair = await fairStart(t, fopt); } catch (e) { fair = { ok: false, msg: '发东西出错：' + String((e && e.message) || e) }; }
+    if (fair && fair.gave && fair.gave.some((g) => g.who === NAME && g.item)) fair.ate = await eatGapple();
+    log(`PVP fair ${fair && fair.ok ? 'ok' : 'off'}: ${fair && fair.msg}`);
+    if (fair && fair.ok) say('咱俩一人一份，金苹果和药水都发了，公平打啊！');
+    else if (fair && fair.ok === false) say('这台机器没给我权限发东西…那咱都空手打，谁也不许偷偷用 buff 哦');
+    PVP.until = Date.now() + secs * 1000;   // 发东西的时间不算进对打时长
+  }
+
+  const hp0 = bot.health;
+  let why = 'timeout';
+  while (Date.now() < PVP.until) {
+    await sleep(250);
+    try {
+      const dd = t.position.distanceTo(bot.entity.position);
+      if (dd < PVP.minDist) PVP.minDist = dd;
+    } catch (e) {}
+    if (!ready || !bot || !bot.entity) { why = 'disconnect'; break; }
+    if (!PVP.active) { why = 'stopped'; break; }
+    if (PVP.target !== t || t.isValid === false || !t.position) { why = 'target_gone'; break; }
+    if (bot.health <= stopHp) { why = 'low_hp'; break; }
+  }
+  const hp = Math.round(bot.health);
+  const hits = PVP.hits, died = !(bot.health > 0);
+  const whiffs = COMBAT.whiffs || 0;
+  endPvp(why);
+
+  if (why === 'disconnect') return { ok: false, msg: '中途掉线了', extra: { why, nm, hp, hits, skill } };
+  if (why === 'low_hp' || died) say('哎呀哎呀打不过，我认输！');
+  else if (why === 'target_gone') say(`${nm} 你跑哪去啦～`);
+  else if (why === 'timeout') say('呼…手都酸了，算平手吧，都不许再动手哦！');
+
+  const zh = {
+    low_hp: `血被压到 ${hp}，乖乖认输了`,
+    target_gone: `${nm} 跑没影了，收手`,
+    timeout: `打满 ${Math.round((Date.now() - PVP.since) / 1000)}s 握手言和`,
+    stopped: '被叫停了',
+    disconnect: '掉线了',
+  }[why] || why;
+  const minD = Number.isFinite(PVP.minDist) ? PVP.minDist : d0;
+  const closeNote = (hits === 0 && minD > REACH) ? `；最近只贴到 ${minD.toFixed(1)} 格，还没够着` : '';
+  const fairNote = fair ? (fair.ok ? '｜开局双方各发了金苹果+药水' : (fair.ok === false ? '｜没权限发东西，双方都没 buff' : '｜没开 buff')) : '';
+  return {
+    ok: true,
+    msg: `[L${skill} ${cfg.name}] 跟 ${nm} 比划了 ${hits} 下${whiffs ? `（手滑 ${whiffs} 次）` : ''}，${zh}（我血 ${Math.round(hp0)} → ${hp}）${closeNote}${fairNote}`,
+    extra: { why, nm, hits, whiffs, hp, hp0, skill, skillName: cfg.name, stopHp: PVP.stopHp, minDist: minD, fair },
+  };
+});
+
 actRegister('eat', async () => {
   const before = bot.food;
   if (before >= 20) return { ok: true, msg: '现在不饿' };
@@ -4061,6 +4493,183 @@ actRegister('eat', async () => {
   } catch (e) {
     return { ok: false, msg: `吃 ${food.name} 没成功：` + (e.message || e) };
   }
+});
+
+// ---------- 药水识别：别把"瞬间伤害"当补药喝了 ----------
+// 效果 id 分三档：好 / 坏 / 无伤（只是不好喝）
+const POTION_GOOD = /healing|regeneration|strength|swiftness|speed|fire_resistance|water_breathing|night_vision|invisibility|leaping|jump_boost|absorption|resistance|slow_falling|luck|turtle_master|health_boost/;
+const POTION_BAD = /harming|harm|instant_damage|poison|wither|slowness|weakness|decay|blindness|nausea|hunger|levitation|bad_omen|unluck|mining_fatigue|darkness|wind_charged|infested|oozing|weaving/;
+const POTION_INSTANT = /harming|harm|instant_damage|instant_health|healing/;   // 瞬间类：一喝立马见血，最不能搞错
+
+// 1.21 药水注册表的数字 id（服务端 potion_contents 里只给数字，不返名字）
+// 顺序与游戏注册表一致，别乱改；个别版本加效果只能往后追加
+const POTION_IDS = [
+  'water', 'mundane', 'thick', 'awkward',
+  'night_vision', 'long_night_vision', 'invisibility', 'long_invisibility',
+  'leaping', 'long_leaping', 'strong_leaping',
+  'fire_resistance', 'long_fire_resistance',
+  'swiftness', 'long_swiftness', 'strong_swiftness',
+  'slowness', 'long_slowness', 'strong_slowness',
+  'turtle_master', 'long_turtle_master', 'strong_turtle_master',
+  'water_breathing', 'long_water_breathing',
+  'healing', 'strong_healing', 'harming', 'strong_harming',
+  'poison', 'long_poison', 'strong_poison',
+  'regeneration', 'long_regeneration', 'strong_regeneration',
+  'strength', 'long_strength', 'strong_strength',
+  'weakness', 'long_weakness', 'luck',
+  'slow_falling', 'long_slow_falling',
+  'wind_charged', 'weaving', 'oozing', 'infested',
+];
+
+function potionNameById(n) {
+  try {
+    const reg = (bot && bot.registry) || {};
+    const tbls = [reg.potions, reg.potionType, reg.potionTypes, reg.potion];
+    for (const tbl of tbls) {
+      if (!tbl) continue;
+      for (const k in tbl) {
+        const e = tbl[k];
+        if (!e) continue;
+        if (Number(e.id) === Number(n)) return String(e.name || k).replace(/^minecraft:/, '');
+      }
+      if (tbl[n] && (tbl[n].name || typeof tbl[n] === 'string')) return String(tbl[n].name || tbl[n]).replace(/^minecraft:/, '');
+    }
+  } catch (e) {}
+  const i = Number(n);
+  if (Number.isFinite(i) && i >= 0 && i < POTION_IDS.length) return POTION_IDS[i];
+  return '';
+}
+
+function effectNameById(n) {
+  try {
+    const tbl = (bot.registry && (bot.registry.effects || bot.registry.effectTypes)) || null;
+    if (tbl) {
+      for (const k in tbl) { const e = tbl[k]; if (e && Number(e.id) === Number(n)) return String(e.name || k).replace(/^minecraft:/, ''); }
+    }
+  } catch (e) {}
+  return '';
+}
+
+function potionIdOf(it) {
+  // 新版在 components 里：{type:'potion_contents', data:{potionId:<数字>, customEffects:[...]}}
+  try {
+    const c = (it && it.components) || [];
+    const arr = Array.isArray(c) ? c : Object.values(c);
+    for (const cc of arr) {
+      const nm = String((cc && (cc.type || cc.name)) || '');
+      if (/potion_contents/i.test(nm)) {
+        let v = cc.data != null ? cc.data : (cc.value != null ? cc.value : cc);
+        if (typeof v === 'string') { try { v = JSON.parse(v); } catch (e) {} }
+        const raw = v && (v.potion || v.Potion);
+        if (raw) return String(raw).replace(/^minecraft:/, '');
+        const pid = v && (v.potionId != null ? v.potionId : v.id);
+        if (pid != null) {
+          const nmv = potionNameById(pid);
+          if (nmv) return nmv;
+          // 认不出来就用自定义效果名拼一个，至少能判好坏
+          const ces = (v.customEffects || v.custom_effects || []).map((e) => (effectNameById(e.effectId != null ? e.effectId : e.id) || ('effect' + (e.effectId != null ? e.effectId : e.id))));
+          if (ces.length) return 'custom:' + ces.join('+');
+          return 'id' + pid;
+        }
+      }
+    }
+  } catch (e) {}
+  try {
+    const n = it && it.nbt;
+    const v = n && (n.value || n);
+    const p = v && (v.Potion && (v.Potion.value || v.Potion));
+    if (p) return String(p).replace(/^minecraft:/, '');
+  } catch (e) {}
+  return '';
+}
+
+// 返回 { id, kind: 'good'|'bad'|'unknown', instant, drinkable, text }
+function potionInfo(it) {
+  const id = potionIdOf(it);
+  const base = id ? id.replace(/^(strong_|long_|strong|long)/, '').replace(/^(strong_|long_)/, '') : '';
+  const probe = (id || base || '').toLowerCase();
+  const name = String(it && it.name).replace('minecraft:', '');
+  const kind = POTION_BAD.test(probe) ? 'bad' : (POTION_GOOD.test(probe) ? 'good' : 'unknown');
+  const instant = POTION_INSTANT.test(probe);
+  const splash = /splash|lingering/.test(name);
+  const shown = id || (kind === 'unknown' ? '水瓶/无效果' : name);
+  const text = shown + (splash ? '（投掷型）' : '（饮用型）') + `｜效果：${kind === 'bad' ? '负面' : kind === 'good' ? '正面' : '未知'}${instant ? '·瞬间类' : ''}`;
+  return { id: shown, base, kind, instant, splash, drinkable: !splash, text };
+}
+
+// 喝药水：饮用型才喝；投掷型只扔；负面/瞬间伤害的一律不喝（防止自残）
+actRegister('drink', async (a) => {
+  if (!bot || !bot.entity) return { ok: false, msg: '还没进服呢' };
+  const want = String((a && (a.item || a.potion || a.kind)) || '').toLowerCase().replace(/^minecraft:/, '');
+  const list = bot.inventory.items().filter((it) => /potion$/.test(String(it.name).replace(/^minecraft:/, '')));
+  if (!list.length) return { ok: false, msg: '背包里一瓶药水都没有（potion / splash_potion 都认）' };
+  // 指定就按名字挑；不指定就优先挑"正面且能喝"的那瓶
+  let it = want ? list.find((x) => String(x.name).toLowerCase().includes(want) || potionInfo(x).id.includes(want)) : null;
+  if (!it) {
+    const cand = list.map((x) => ({ x, info: potionInfo(x) }));
+    it = (cand.find((c) => c.info.kind === 'good' && c.info.drinkable) || cand.find((c) => c.info.drinkable) || cand[0]).x;
+  }
+  const info = potionInfo(it);
+  const mode = a.mode || (info.splash ? 'throw' : 'drink');
+  log(`DRINK ${it.name} potion=${info.id} kind=${info.kind} instant=${info.instant} mode=${mode}`);
+
+  // 安全闸：负面的一律不喝；看不出来是啥的也不喝（怕误判），要喝得显式 force
+  if (mode !== 'throw' && !a.force) {
+    if (info.kind === 'bad') {
+      return {
+        ok: false,
+        msg: `这瓶是「${info.id}」，负面效果${info.instant ? '（还是瞬间类的，一喝就掉血）' : ''}，我不喝！`
+          + (info.splash ? '要整人的话我朝对方扔？{"mode":"throw","target":"名字"}' : '这种倒掉算了，别浪费我血'),
+        extra: { blocked: 'bad', ...info },
+      };
+    }
+    if (info.kind === 'unknown') {
+      return {
+        ok: false,
+        msg: `这瓶我认不出是什么（${info.id}），万一是瞬间伤害就亏了，先不喝。确定没事就加 {"force":true}`,
+        extra: { blocked: 'unknown', ...info },
+      };
+    }
+  }
+  if (mode === 'drink' && info.splash) {
+    return { ok: false, msg: `这是投掷型药水，喝不了；要我朝人扔就说 {"mode":"throw","target":"名字"}`, extra: { blocked: 'splash', ...info } };
+  }
+  try {
+    await bot.equip(it, 'hand');
+    if (mode === 'throw') {
+      const tgt = a.target ? findPlayer(a.target) : null;
+      if (tgt && tgt.position) await bot.lookAt(tgt.position.offset(0, 1.3, 0), true);
+      await bot.activateItem();
+      await bot.waitForTicks(10);
+      try { await equipBestWeapon(); } catch (e) {}
+      return { ok: true, msg: `朝 ${tgt ? tgt.username : '前面'} 扔了「${info.id}」（${info.kind === 'bad' ? '负面' : '正面'}），落点准不准看运气`, extra: { ...info, target: tgt ? tgt.username : null } };
+    }
+    await bot.activateItem();
+    await bot.waitForTicks(40);
+    try { await equipBestWeapon(); } catch (e) {}
+    return { ok: true, msg: `喝了「${info.id}」（${info.kind === 'good' ? '正面' : '中性'}），不是负面那种，放心`, extra: { ...info } };
+  } catch (e) {
+    return { ok: false, msg: `${mode === 'throw' ? '扔' : '喝'} ${it.name} 没成功：` + (e.message || e), extra: { ...info } };
+  }
+});
+
+// 只看不喝：列出背包里的药水各是什么效果，方便决定喝哪个
+// 调试/自救口：直接发一条指令（默认只用来发物品、上效果、切模式，别乱来）
+actRegister('opcmd', async (a) => {
+  const cmd = String((a && (a.cmd || a.command)) || '').trim();
+  if (!cmd) return { ok: false, msg: '要发什么指令？{"cmd":"/give @s potion 1"}' };
+  const ms = Math.max(600, Math.min(6000, Number((a && a.ms) || 2500)));
+  const full = cmd.startsWith('/') ? cmd : '/' + cmd;
+  const r = await opCmd(full, ms);
+  return { ok: r.ok, msg: `${full} → ${r.ok ? '发出去了' : '失败'}（${r.msg}）`, extra: { cmd: full, reply: r.msg } };
+});
+
+actRegister('potions', async () => {
+  if (!bot || !bot.entity) return { ok: false, msg: '还没进服呢' };
+  const list = bot.inventory.items().filter((it) => /potion$/.test(String(it.name).replace(/^minecraft:/, '')));
+  if (!list.length) return { ok: false, msg: '背包里没有药水' };
+  const lines = list.map((it) => { const i = potionInfo(it); return `${i.id}×${it.count}${i.splash ? '(投掷)' : '(可喝)'}${i.kind === 'bad' ? '⚠负面' : ''}`; });
+  return { ok: true, msg: lines.join('｜'), extra: { list: list.map((it) => ({ name: it.name, count: it.count, ...potionInfo(it), raw: JSON.stringify(it.components || null).slice(0, 400), nbt: JSON.stringify(it.nbt || null).slice(0, 600) })) } };
 });
 
 actRegister('toss', async (a) => {

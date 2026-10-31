@@ -20,6 +20,11 @@ baseline*.json
 *.log
 *.log.*
 
+# ==== 一次性草稿 / 补丁片段（内容早已并入 play.js）====
+_*_patch.*
+_*.js
+_*.py
+
 # ==== 大文件 / 备份 ====
 play.js.bak*
 *.bak*

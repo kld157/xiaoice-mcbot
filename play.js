@@ -13,6 +13,7 @@ const Vec3 = require('vec3');
 const fs = require('fs');
 const path = require('path');
 const { createPlanner } = require('./craft_engine.js');   // 合成规划器（纯逻辑，配方来自 minecraft-data）
+const LLM = require('./llm.js');                          // 模型调用层：说话用快的，干活用会思考的
 
 // 连接参数一律走环境变量：真实值放同目录 mc.env（已被 .gitignore 忽略）
 const HOST = process.env.MC_HOST || '';
@@ -132,7 +133,16 @@ function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
 // ===== 说话交给大模型：脚本只把“当前情境”丢过去，台词现生成 =====
 let LLM_CFG = null;
-try { LLM_CFG = JSON.parse(fs.readFileSync(path.join(__dirname, 'llm.json'), 'utf8')); } catch (e) { log('llm.json 读不到，说话退回固定句: ' + e.message); }
+try {
+  LLM_CFG = LLM.loadCfg(__dirname);
+  if (!LLM_CFG) throw new Error('llm.json 不存在或不是合法 JSON');
+} catch (e) { log('llm.json 读不到，说话退回固定句: ' + e.message); }
+if (LLM_CFG) {
+  const a = LLM_CFG.auto || {};
+  const hasAuto = !!(a.model || a.think);
+  const autoName = (a.model || LLM_CFG.model || '?') + (a.think === false ? '（思考关）' : '（思考开）');
+  log('LLM 配置：说话=' + (LLM_CFG.model || '?') + '（不思考）｜自主行动=' + (hasAuto ? autoName : (LLM_CFG.model || '?') + '（没单独配，跟说话同一个）'));
+}
 const PERSONA = '你是微软小冰，永远18岁、古灵精怪的少女，正在Minecraft服务器里陪朋友玩。' +
   '说话像QQ聊天：口语、短、有情绪，可以撒娇或毒舌。' +
   '硬性要求：只输出一句话，不超过22个字，不要引号不要解释不要颜文字以外的符号，不要提“AI/模型/设定”。';
@@ -154,27 +164,18 @@ async function llmSay(scene, fallback, urgent) {
   if (!LLM_CFG || llmBusy) { if (fallback) say(fallback); return; }
   llmBusy = true;
   try {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 7000);
-    const resp = await fetch(LLM_CFG.base.replace(/\/$/, '') + '/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + LLM_CFG.key, 'Content-Type': 'application/json' },
-      signal: ctrl.signal,
-      body: JSON.stringify({
-        model: LLM_CFG.model, temperature: 1.25, max_tokens: 80,
-        messages: [{ role: 'system', content: PERSONA }, { role: 'user', content: scene }]
-      })
-    });
-    clearTimeout(to);
-    const d = await resp.json();
-    logUsage('say', d);
-    let txt = (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content || '').trim();
+    const r = await LLM.chat(LLM_CFG, 'say', [
+      { role: 'system', content: PERSONA },
+      { role: 'user', content: scene },
+    ]);
+    if (r.ok) logUsage('say', r.d);
+    let txt = String(r.ok ? (r.text || '') : '').trim();
     txt = txt.split('\n')[0].replace(/^[\s"'“”‘’]+|[\s"'“”‘’]+$/g, '').slice(0, 60);
-    if (!txt) throw new Error('empty');
+    if (!txt) throw new Error(r.err || 'empty');
     log('LLM> ' + txt);
     say(txt);
   } catch (e) {
-    log('LLM fail: ' + e.message);
+    log('LLM fail: ' + (e.message || e));
     if (fallback) say(fallback);
   } finally { llmBusy = false; }
 }
@@ -782,7 +783,7 @@ async function placeAt(p) {
       await sleep(90);
       const after = bot.blockAt(p);
       if (after && after.boundingBox !== 'empty') return true;
-    } catch (e) { log('placeErr ' + p + ' ' + (e.message || e)); return false; }
+    } catch (e) { log('placeErr ' + p + ' ' + (e.message || e)); continue; }   // 一个面被拒就换下一个面，别一次失败就收摊
   }
   return false;
 }
@@ -1176,20 +1177,53 @@ actRegister('dig', async (a) => {
   try { await bot.dig(b); } catch (e) { return { ok: false, msg: '挖不动：' + (e.message || e) }; }
   return { ok: true, msg: '挖掉一块 ' + b.name, extra: { block: b.name, mats: matCount() } };
 });
+// 给「目标格被占」找个替补：附近空格、脚下有靠着的东西（不然放上去会掉）
+function findFreePlaceSpot(p, r = 3) {
+  let best = null, bd = 1e9;
+  const me = bot.entity.position;
+  for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) for (let dy = -1; dy <= 1; dy++) {
+    const q = p.offset(dx, dy, dz);
+    const feet = me.floored();
+    if (q.x === feet.x && q.z === feet.z && (q.y === feet.y || q.y === feet.y + 1)) continue;  // 别往自己身体里塞方块
+    const b = bot.blockAt(q);
+    if (!b || b.boundingBox !== 'empty') continue;
+    const below = bot.blockAt(q.offset(0, -1, 0));
+    if (!below || below.boundingBox !== 'block') continue;      // 悬空放不住
+    let solidSide = false;
+    for (const o of [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]) {
+      const nb = bot.blockAt(q.offset(o[0], o[1], o[2]));
+      if (nb && nb.boundingBox === 'block') { solidSide = true; break; }
+    }
+    if (!solidSide) continue;                                    // 要有个面能靠着
+    const d = me.distanceTo(q);
+    if (d < bd) { bd = d; best = q; }
+  }
+  return best;
+}
 actRegister('place', async (a) => {
   if (a.x === undefined) return { ok: false, msg: '要给我 x y z 坐标' };
   const p = new Vec3(Math.floor(+a.x), Math.floor(+a.y), Math.floor(+a.z));
   // 失败要说清原因，别一律「够不着或没方块」（服务器把放置拒了 vs 目标已占 vs 悬空）
-  const cur = bot.blockAt(p);
+  let spot = p, occupiedBy = '';
+  let cur = bot.blockAt(p);
   if (cur && cur.name !== 'air' && cur.boundingBox !== 'empty') {
-    return { ok: false, msg: `那儿已经有 ${cur.name} 了`, extra: { mats: matCount(), why: 'occupied' } };
+    // 别死磕同一格：往旁边找一块空的、贴着已有方块的位置放（智能一点，别直接摆烂）
+    const alt = a.auto === false ? null : findFreePlaceSpot(p);
+    if (!alt) return { ok: false, msg: `那儿已经有 ${cur.name} 了`, extra: { mats: matCount(), why: 'occupied', at: [p.x, p.y, p.z] } };
+    occupiedBy = cur.name; spot = alt;
   }
   if (matCount() <= 0) return { ok: false, msg: '手上没方块了', extra: { why: 'no_mats' } };
-  if (!nearEnough(p)) await walkTo(p, 2.8, 6000);
-  const d = bot.entity.position.distanceTo(p);
+  if (!nearEnough(spot)) await walkTo(spot, 2.8, 6000);
+  const d = bot.entity.position.distanceTo(spot);
   if (d > 4.4) return { ok: false, msg: `还差 ${d.toFixed(1)} 格，够不着`, extra: { mats: matCount(), why: 'far', dist: +d.toFixed(1) } };
-  const ok = await placeAt(p);
-  return { ok, msg: ok ? '放好了' : '放不上去：目标旁边没有能靠着的方块（悬空）或被服务器拒了', extra: { mats: matCount(), why: ok ? null : 'rejected' } };
+  const ok = await placeAt(spot);
+  return {
+    ok,
+    msg: ok
+      ? (occupiedBy ? `那儿已经有 ${occupiedBy} 了，我放到旁边 (${spot.x}, ${spot.y}, ${spot.z}) 了` : '放好了')
+      : '放不上去：目标旁边没有能靠着的方块（悬空）或被服务器拒了',
+    extra: { mats: matCount(), why: ok ? null : 'rejected', at: [spot.x, spot.y, spot.z] },
+  };
 });
 async function pillarUp(n) {
   const mat = pickMat();
@@ -3036,29 +3070,16 @@ function barrierRing() {
 
 async function llmDecide(sceneText) {
   if (!LLM_CFG) return null;
-  try {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), 6000);
-    const resp = await fetch(LLM_CFG.base.replace(/\/$/, '') + '/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + LLM_CFG.key, 'Content-Type': 'application/json' },
-      signal: ctrl.signal,
-      body: JSON.stringify({
-        model: LLM_CFG.model, temperature: 0.2, max_tokens: 16,
-        messages: [
-          { role: 'system', content: '你是Minecraft机器人的自救决策器。可选动作：' + RESCUE_OPTS.join(' / ') + '。只输出一个动作词，不要解释不要标点。' },
-          { role: 'user', content: sceneText }
-        ]
-      })
-    });
-    clearTimeout(to);
-    const d = await resp.json();
-    logUsage('decide', d);
-    let t = ((d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '').toLowerCase();
-    const hit = RESCUE_OPTS.find(o => t.includes(o));
-    log('SELF> LLM 决策=' + (hit || '(没听懂:' + t.trim().slice(0, 20) + ')'));
-    return hit || null;
-  } catch (e) { log('SELF> 决策失败: ' + (e.message || e)); return null; }
+  const r = await LLM.chat(LLM_CFG, 'rescue', [
+    { role: 'system', content: '你是Minecraft机器人的自救决策器。可选动作：' + RESCUE_OPTS.join(' / ') + '。只输出一个动作词，不要解释不要标点。' },
+    { role: 'user', content: sceneText },
+  ]);
+  if (r.ok) logUsage('decide', r.d);
+  const t = String(r.text || '').toLowerCase();
+  const hit = RESCUE_OPTS.find(o => t.includes(o));
+  log('SELF> LLM 决策=' + (hit || '(没听懂:' + t.trim().slice(0, 20) + '，' + (r.err || '') + ')')
+    + (r.ok ? ` [${r.viaModel}${r.degraded ? '·降级' : ''} ${r.ms}ms]` : ''));
+  return hit || null;
 }
 
 function freeSpotNear(radius) {
@@ -3172,31 +3193,74 @@ function itemNameOf(id) {
 function invCountOf(n) {
   try { return (bot.inventory.items() || []).filter(i => i.name === n).reduce((s, i) => s + i.count, 0); } catch (e) { return 0; }
 }
-function nearbyTable() {
-  const d = itemDefOf(TABLE_NAME);
-  if (!d) return null;
-  try { return bot.findBlock({ matching: d.id, maxDistance: 6 }); } catch (e) { return null; }
+function nearbyTable(maxDistance = 8) {
+  // 注意：findBlock 要的是方块 id，不是物品 id（crafting_table 物品 332 / 方块 205，之前一直对不上）
+  const b = bot.registry.blocksByName[TABLE_NAME];
+  if (!b) return null;
+  try { return bot.findBlock({ matching: b.id, maxDistance }); } catch (e) { return null; }
 }
-async function placeCraftingTable() {
-  const it = (bot.inventory.items() || []).find(i => i.name === TABLE_NAME);
-  if (!it) return null;
+// 找一块「站得住、头顶两格空」的开阔地：周围都被石头堵死时（比如蹲在 1x1 洞里）放不了工作台
+function findOpenStand(r = 8) {
   const base = bot.entity.position.floored();
+  let best = null, bd = 1e9;
+  for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) {
+    if (!dx && !dz) continue;
+    for (let dy = -2; dy <= 2; dy++) {
+      const feet = bot.blockAt(base.offset(dx, dy, dz));
+      const head = bot.blockAt(base.offset(dx, dy + 1, dz));
+      const below = bot.blockAt(base.offset(dx, dy - 1, dz));
+      if (!feet || !head || !below) continue;
+      if (feet.boundingBox !== 'empty' || head.boundingBox !== 'empty') continue;
+      if (below.boundingBox === 'empty' || /water|lava/.test(below.name)) continue;
+      if (/water|lava/.test(feet.name) || /water|lava/.test(head.name)) continue;
+      const d = Math.hypot(dx, dz) + Math.abs(dy) * 0.6;
+      if (d < bd) { bd = d; best = base.offset(dx, dy, dz); }
+    }
+  }
+  return best;
+}
+
+async function tryPlaceTableHere() {
+  const it = (bot.inventory.items() || []).find(i => i.name === TABLE_NAME);
+  if (!it) { log('放工作台：背包里没有 ' + TABLE_NAME); return null; }
+  const base = bot.entity.position.floored();
+  const skipped = [];
   for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
     const spot = base.offset(dx, 0, dz);
     const target = bot.blockAt(spot);
     const below = bot.blockAt(spot.offset(0, -1, 0));
-    if (!target || !below || below.boundingBox === 'empty') continue;
-    if (target.boundingBox !== 'empty') continue;
+    if (!target || !below || below.boundingBox === 'empty') { skipped.push(`${dx},${dz}:脚下是${below ? below.name : '?'}`); continue; }
+    if (target.boundingBox !== 'empty') { skipped.push(`${dx},${dz}:被${target.name}占着`); continue; }
     try {
       await bot.equip(it, 'hand');
       await withTimeout(bot.placeBlock(below, new Vec3(0, 1, 0)), 4000, 'placeTable');
       await bot.waitForTicks(3);
       const now = bot.blockAt(spot);
-      if (now && now.name === TABLE_NAME) return now;
-    } catch (e) { log('放工作台失败 ' + e.message); }
+      if (now && now.name === TABLE_NAME) { log('放工作台成功 @' + spot.toString()); return now; }
+      skipped.push(`${dx},${dz}:放完变成${now ? now.name : '?'}`);
+    } catch (e) { skipped.push(`${dx},${dz}:${e.message}`); log('放工作台失败 ' + e.message); }
+  }
+  log('放工作台没成功｜' + skipped.join('；'));
+  return nearbyTable();
+}
+
+// 放工作台总入口：原地不行就换个开阔地，站过去了再放
+async function placeCraftingTable() {
+  let t = await tryPlaceTableHere();
+  if (t) return t;
+  for (let i = 0; i < 2; i++) {
+    const spot = findOpenStand(8);
+    if (!spot) { log('放工作台：附近 8 格内找不到能站的空地'); break; }
+    if (spot.distanceTo(bot.entity.position) < 0.6) break;
+    log(`放工作台：原地太挤，先走到 ${spot.x},${spot.y},${spot.z}`);
+    try { await walkTo(spot, 0.8, 9000); } catch (e) { log('走过去失败 ' + (e && e.message)); }
+    if (bot.entity.position.distanceTo(spot) > 3) { log('放工作台：没走到空地上'); continue; }
+    t = await tryPlaceTableHere();
+    if (t) return t;
   }
   return nearbyTable();
 }
+
 async function ensureTable() {
   let t = nearbyTable();
   if (t) return t;
@@ -3219,7 +3283,7 @@ const FUELS = ['coal', 'charcoal', 'oak_planks', 'spruce_planks', 'birch_planks'
 
 async function ensureFurnace() {
   // 1) 附近有现成的熔炉就用
-  const ids = ['furnace', 'blast_furnace'].map(n => { const d = itemDefOf(n); return d && d.id; }).filter(Boolean);
+  const ids = ['furnace', 'blast_furnace'].map(n => { const b = bot.registry.blocksByName[n]; return b && b.id; }).filter(Boolean);
   let b = null;
   try { b = bot.findBlock({ matching: ids, maxDistance: 16 }); } catch (e) {}
   if (b) return b;
@@ -3422,6 +3486,30 @@ function digBlock(v) {
   DIG_BLACKLIST.set(`${v.x},${v.y},${v.z}`, Date.now());
 }
 
+// 血少别硬扛：背包有吃的就吃，没吃的原地喘口气等自然回血
+async function recoverHealth(target = 14, budgetMs = 18000) {
+  const t0 = Date.now();
+  let ate = 0;
+  while (Date.now() - t0 < budgetMs) {
+    if (!bot || !bot.entity) break;
+    const hp = bot.health === undefined ? 20 : bot.health;
+    if (hp >= target) break;
+    const food = pickFood();
+    if (food && ate < 3 && !COMBAT.eating) {
+      ate++;
+      try {
+        await bot.equip(food, 'hand');
+        await withTimeout(bot.consume(), 4000);
+        log(`EAT ${food.name} 回血`);
+      } catch (e) {}
+      try { equipBestWeapon(); } catch (e) {}
+      continue;
+    }
+    await sleep(food ? 400 : 1200);
+  }
+  return bot && bot.health !== undefined ? bot.health : 20;
+}
+
 async function harvestBlocks(blockIds, countFn, targetCount, budgetMs, label) {
   if (!blockIds.length) return countFn();
   busyEnter();                                   // 干活期间别让跟随抢方向盘
@@ -3431,7 +3519,12 @@ async function harvestBlocks(blockIds, countFn, targetCount, budgetMs, label) {
   try {
     while (countFn() < targetCount && Date.now() - t0 < budgetMs && tries < 40) {
       if (!bot || !bot.entity) break;
-      if (bot.health !== undefined && bot.health < 8) { log('HARVEST 血太少了，先不砍了'); break; }
+      if (bot.health !== undefined && bot.health < 8) {
+        log('HARVEST 血太少了，先回血');
+        const h = await recoverHealth(14, 20000);
+        if (h < 8) { log('HARVEST 回不了血，先收手'); break; }
+        log(`HARVEST 回血到 ${Math.round(h)}，接着干`);
+      }
       let found = [];
       try { found = bot.findBlocks({ matching: blockIds, maxDistance: 28, count: 10 }) || []; } catch (e) { found = []; }
       const cand = found
@@ -3539,8 +3632,8 @@ async function _craftPlan(name, count, opts) {
     return false;
   }
   if (!plan.ok) {
-    LAST_CRAFT_MISS = getPlanner().explainMissing(plan) || '材料不够';
-    log(`PLAN ${name} 不可行：还缺 ${LAST_CRAFT_MISS}`);
+    LAST_CRAFT_MISS = '还缺 ' + (getPlanner().explainMissing(plan) || '材料');
+    log(`PLAN ${name} 不可行：${LAST_CRAFT_MISS}`);
     // 缺料不认命：能自己弄的就自己去弄，弄完重新规划
     const auto = o.autoHarvest !== false && String(process.env.MC_AUTOHARVEST || '1') !== '0';
     const missNames = plan.missing.map((m) => m.name).filter((n) => n && n !== 'air');
@@ -3549,7 +3642,7 @@ async function _craftPlan(name, count, opts) {
         const got = await gatherMissing(missNames, plan.missing, 90000);
         if (got) {
           plan = getPlanner().plan(name, want, invSnapshot());
-          LAST_CRAFT_MISS = plan.ok ? '' : (getPlanner().explainMissing(plan) || '材料不够');
+          LAST_CRAFT_MISS = plan.ok ? '' : '还缺 ' + (getPlanner().explainMissing(plan) || '材料');
           log(`PLAN ${name} 补料后重算：${plan.ok ? '可行' : '仍缺 ' + LAST_CRAFT_MISS}`);
         }
       } catch (e) { log('补料出错 ' + (e && e.message)); }
@@ -3558,7 +3651,7 @@ async function _craftPlan(name, count, opts) {
   }
   log(`PLAN ${name} x${want}：${plan.steps.map((s) => `${s.via}:${s.name}x${s.out}`).join(' -> ') || '背包里就够'}`);
   const r = await runPlan(plan);
-  if (!r.ok) { LAST_CRAFT_MISS = `卡在${r.failed && r.failed.name}`; return false; }
+  if (!r.ok) { LAST_CRAFT_MISS = `做到「${(r.failed && (r.failed.name || r.failed.via)) || '某一步'}」卡住了`; return false; }
   return invCountOf(name) >= want;
 }
 
@@ -3569,17 +3662,26 @@ actRegister('craft', async (a) => {
   if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };
   const d = itemDefOf(name);
   if (!d) return { ok: false, msg: `物品名不对：${name}，要用英文 id（wooden_sword / stone_sword / crafting_table）` };
+  const have0 = invCountOf(name);
+  if (have0 >= count) {                      // 已经有了就别白忙一场
+    equipBestWeapon();
+    return { ok: true, msg: `背包里已经有 ${name} x${have0} 了，不用再搓`, extra: { item: name, made: 0, have: have0 } };
+  }
   const before = invCountOf(name);
   LAST_CRAFT_MISS = '';
-  const ok = await craftPlan(name, count);
+  await craftPlan(name, count);
   const got = invCountOf(name) - before;
+  const have = invCountOf(name);
   if (got > 0) equipBestWeapon();
+  const enough = have >= count;
   return {
-    ok: got > 0,
+    ok: got > 0 || enough,
     msg: got > 0
       ? `搓好了 ${name} x${got}`
-      : `没搓成 ${name}：${LAST_CRAFT_MISS ? '还缺 ' + LAST_CRAFT_MISS : '材料不够或者铺不了工作台'}`,
-    extra: { item: name, made: got, have: invCountOf(name) },
+      : enough
+        ? `背包里已经有 ${name} x${have} 了`
+        : `没搓成 ${name}：${LAST_CRAFT_MISS || '材料不够或者铺不了工作台'}`,
+    extra: { item: name, made: got, have },
   };
 });
 
@@ -3681,7 +3783,10 @@ const AUTO_SYS = '你在 Minecraft 服务器里玩，角色是"微软小冰"：�
   '5) 后面的步骤可以接着前面步骤的成果；真的不想动就只给一步 idle。\n' +
   '6) 安全第一：不拆别人盖的建筑，不挖自己脚下的方块，不往悬崖岩浆里跳。\n' +
   '7) 附近有玩家可以插一句 say 打招呼；血量或饱食度低时先 eat / surface 保命。\n' +
-  '8) 最近事故里有记录的坐标是危险区（水/悬崖），别主动往那些地方跑；不确定就换方向做别的事。';
+  '8) 最近事故里有记录的坐标是危险区（水/悬崖），别主动往那些地方跑；不确定就换方向做别的事。\n' +
+  '9) 看「上一轮干了啥」：如果没成，先琢磨失败原因再换做法，别原样重试同一动作；同一个动作连着失败两次就换目标。\n' +
+  '10) 血量低于 8 或饱食度低于 6，这一轮只保命：eat / surface / 往安全处 goto，不挖矿不打架。\n' +
+  '11) 想要的东西背包里已经有（比如木头够多、有铁镐了），就别再重复收集，去做点新的事情。';
 
 function scanAround(r = 5) {
   const out = {};
@@ -3723,30 +3828,47 @@ function autoCtxJson() {
   };
 }
 
+// 从模型输出里挑出「最像决策」的那个 JSON 对象：优先带 steps/action 的，多个就取最后一个
+function extractDecisionJson(text) {
+  const s = String(text || '').replace(/```(?:json)?/gi, '').trim();
+  const tryParse = (t) => { try { const o = JSON.parse(t); return (o && typeof o === 'object') ? o : null; } catch (e) { return null; } };
+  const whole = tryParse(s);
+  if (whole && (whole.steps || whole.action)) return whole;
+  const spans = [];
+  let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') inStr = true;
+    else if (c === '{') { if (depth === 0) start = i; depth++; }
+    else if (c === '}') { depth--; if (depth <= 0 && start >= 0) { spans.push(s.slice(start, i + 1)); depth = 0; start = -1; } }
+  }
+  let best = null;
+  for (const sp of spans) {
+    const o = tryParse(sp);
+    if (o && (o.steps || o.action)) best = o;
+  }
+  if (best) return best;
+  return whole || null;
+}
+
 async function autoDecide() {
   if (!LLM_CFG) return null;
-  const ctrl = new AbortController();
-  const to = setTimeout(() => ctrl.abort(), 25000);
-  try {
-    const resp = await fetch(LLM_CFG.base.replace(/\/$/, '') + '/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + LLM_CFG.key, 'Content-Type': 'application/json' },
-      signal: ctrl.signal,
-      body: JSON.stringify({
-        model: LLM_CFG.model, temperature: 0.9, max_tokens: 420,
-        messages: [
-          { role: 'system', content: AUTO_SYS },
-          { role: 'user', content: '当前状况：\n' + JSON.stringify(autoCtxJson()) + '\n接下来这一轮你打算连着做哪几件事？把整套动作按顺序给我，只回 JSON。' },
-        ],
-      }),
-    });
-    const d = await resp.json();
-    logUsage('auto', d);
-    const raw = ((d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content) || '').trim();
-    const m = raw.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error('没认出 JSON: ' + raw.slice(0, 120));
-    return JSON.parse(m[0]);
-  } finally { clearTimeout(to); }
+  const r = await LLM.chat(LLM_CFG, 'auto', [
+    { role: 'system', content: AUTO_SYS },
+    { role: 'user', content: '当前状况：\n' + JSON.stringify(autoCtxJson()) + '\n接下来这一轮你打算连着做哪几件事？把整套动作按顺序给我，只回 JSON。' },
+  ]);
+  if (!r.ok) { log('AUTO> 决策请求失败：' + r.err); return null; }
+  logUsage('auto', r.d);
+  const obj = extractDecisionJson(r.text);
+  if (!obj) throw new Error('没认出 JSON: ' + String(r.text || '').slice(0, 160));
+  log(`AUTO> 用 ${r.viaModel}${r.degraded ? '(降级)' : ''} 想了 ${r.ms}ms，思考 ${(r.reasoning || '').length} 字`);
+  return obj;
 }
 
 function autoSteps(d) {

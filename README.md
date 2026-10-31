@@ -1,83 +1,126 @@
-# MC Bot 探针工具
+# 小冰 Minecraft Bot
 
-服务器探针 & Cortico 验证用脚本。环境：Node v24.18.0 + mineflayer + minecraft-data。
+一个常驻的 Minecraft 陪玩机器人：由 [mineflayer](https://github.com/PrismarineJS/mineflayer) 驱动，
+接一个大模型当“脑子”，能聊天、跟随、采集、合成、盖房子、打怪，也会自己找事做（自动巡游式自主行动）。
 
-## 文档
+不是“脚本刷资源”工具，目标是把一个有人味的角色放进服务器里，让它陪人玩。
 
-- `cortico create.md` — Cortico × Create 直播 bot 调研交接文档（41KB，13 章）。
-  方案选型、协议细节、Create 数据层分析都在里面，开工前先读这份。
-  早期版本见 `archive/cortico create.md.bak-20261022`。
+## 特性
 
-## 脚本
+- **会聊**：玩家说话就走 LLM，语气、上下文（最近 6 轮）、人格设定都在 `mc_bridge.py` 里。
+- **会干活**：走位、跟人、挖、放、搭柱子、盖房、采集、拾取、合成、打怪、吃东西、换护甲。
+- **会自己玩**：默认每 10 分钟让模型决定接下来做什么（继续 / 换事 / 发呆），有人下指令时自动让路 20 分钟。
+- **扛得住**：自动重连、死亡重生、防 AFK、内存看门狗（超软线清理 GC，超硬线自杀让 watchdog 重拉）。
+- **可观测**：`play.log` 有结构化日志（位置/血量/伤害来源/挖放失败原因），还提供 `flags`、`drops`、`inventory` 等只读诊断动作。
 
-### `install_mineflayer.sh` — 一键装环境（幂等）
+## 环境要求
 
-```bash
-sh mcbot/install_mineflayer.sh                              # 缺什么装什么，已装则秒退
-sh mcbot/install_mineflayer.sh --force                      # 强制重装（先删包再装）
-MINEFLAYER_VERSION=4.39.0 sh mcbot/install_mineflayer.sh     # 锁版本
-```
-
-做的事：检查 node/npm（要求 >= 18）→ 检测 `mineflayer` / `mineflayer-pathfinder`
-能否 require → 缺则 `npm install`，常规源失败自动切 npmmirror 重试 →
-最后校验并补装 `minecraft-data`。退出码 0 表示环境可用。
-
-> 换机器 / 重装容器后跑这一条就够了，不用再手动 npm install。
-
-### `drift.js` — registry 漂移巡检
-
-连进服务器，抓 `configuration` 阶段的 `registry_data`，跟 `baseline.json` 比对。
-
-```bash
-node drift.js check      # 比对当前服务器 vs 基线，有变化会列出来
-node drift.js baseline   # 重建基线（会备份旧的）
-```
-
-覆盖的注册表：biome / chat_type / damage_type / dimension_type / enchantment /
-instrument / jukebox_song / painting_variant / trim_material / trim_pattern / wolf_variant 等 23 个。
-
-> 注意：`minecraft:block` / `minecraft:item` **不在** registry_data 里（1.20.5+ 起是静态注册，
-> 靠客户端本地数据同步），所以方块这一层 protocol 层面根本抓不到 —— 要用 `chunk_scan.js` 从区块里反推。
-
-### `chunk_scan.js` — 区块 stateId 扫描
-
-全 section 解析 `level_chunk_with_light`，统计所有 stateId，找出超出原版范围的（= mod 方块）。
-
-```bash
-node chunk_scan.js
-```
-
-判定逻辑：`stateId > 原版上限` → 服务器上确实有 mod 方块在跑。
-
-## 实测结论（2026-10-24）
-
-服务器 `mc.example.com:25565`，MC 1.21.11，离线身份 `xiaoice`。
-
-| 项目 | 结果 |
+| 项目 | 要求 |
 |---|---|
-| 连通性 | ✅ 握手正常，能完整解析区块 |
-| registry_data | 23 个注册表，无 block/item |
-| 原版基线 | 1166 种方块 / **29671 个 state**（0..29670） |
-| 区块扫描 | 135 区块 / 3240 section / **0 解析异常** |
-| 实际 state | 130 种，范围 0 .. 29376 |
-| **越界数量** | **0 个** |
-| 判定 | **服务器未装 Create，纯原版 + 数据包** |
+| Node.js | ≥ 18（实测 v24.18.0） |
+| Python | ≥ 3.8（仅桥接层需要） |
+| Minecraft | 1.21.11（`MC_VER` 可改） |
+| 依赖 | `mineflayer`、`mineflayer-pathfinder`、`minecraft-data` |
 
-⚠️ 踩过的坑：`27722` 一度被我误判成「超界的 mod 方块」，实际是 **deepslate（深板岩）**。
-旧笔记里「1.20.6 = 26683 个 state」是**另一个版本**的数字，不能拿来当 1.21.11 的基线。
+服务器使用离线身份 + EasyAuth（`/register`、`/login`），默认走 `auth: 'offline'`。
 
-## 待办
+## 快速开始
 
-- [ ] Create 的 stateId 顺序验证 → 需要一台真装了 Create Fly 的服务端（本地开服最省事）
-- [ ] `mod-blocks.ts` 的 drift 假设（Create 接在原版之后）尚未被任何真实数据验证
+```bash
+# 1. 装依赖（幂等，缺什么装什么，失败自动切 npmmirror）
+sh install_mineflayer.sh
 
-## archive/
+# 2. 配置模型（不进版本库）
+cat > llm.json <<'EOF'
+{ "base": "https://api.example.com/v1", "model": "your-model", "key": "sk-..." }
+EOF
 
-早期一次性探测脚本和日志，留着备查，不用了。
+# 3. 启动
+sh start.sh        # 前台安全启动/重启 play.js
+sh watchdog.sh     # 或者用守护模式：挂了自动拉起（单实例）
+python3 mc_bridge.py   # 另开一个进程，负责“说话”和“思考”
+```
 
-## token 记账（余额插件的数据源）
+连接参数全走环境变量，改代码不用动：
 
-- 每次 LLM 调用的 usage 追加到 `mc_usage/YYYY-MM-DD.jsonl`（一行一次，本地时区）。
-- 账本自清理：超过保留期的按天文件每天自动删一次（启动时 + 每晚跨天时），
-  默认保留 **90 天**，可用环境变量 `MC_USAGE_KEEP_DAYS` 调（`<=0` 表示永不删）。
-- `mc_usage.jsonl.migrated-*` 是旧单文件账本的留档，同样按保留期清掉。
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `MC_HOST` / `MC_PORT` | `mc.example.com` / `25565` | 服务器地址 |
+| `MC_VER` | `1.21.11` | 协议版本 |
+| `MC_NAME` / `MC_PW` | `xiaoice_bot` / — | 离线身份与登录密码 |
+| `MC_AUTO` / `MC_AUTO_MS` | `1` / `600000` | 自主行动开关与决策间隔（最小 60s） |
+| `MC_HEAP_SOFT` / `MC_HEAP_HARD` | 400MB / 700MB | 内存软线（清理 GC）、硬线（优雅重启） |
+| `MC_GC_TRIM` | 220MB | 到这个量先收一遍 GC |
+| `MC_AUTOHARVEST` | `1` | 盖房时是否顺路采集材料 |
+| `MC_FORCE_SURVIVAL` | `1` | 上线若被切成冒险模式，自动 `/gamemode survival` |
+| `MC_USAGE_KEEP_DAYS` | `90` | token 账本保留天数（`<=0` 永不清理） |
+
+## 游戏内怎么用
+
+直接说话就行，提到“小冰”或者干脆下指令：
+
+| 说法 | 行为 |
+|---|---|
+| 过来 / 跟着我 / follow | 跟随最近的那个人 |
+| 停 / 别动 / stop | 停下（盖房时也会立刻停工） |
+| 建个房子 / 搭个屋 | 自己找地方、采料、盖好 |
+| 挖 / 吃 / 跳 / 位置 / 转圈 | 对应单步动作 |
+| 背包 / 帮助 / 调试 | 查询与诊断 |
+| 对着它挥手（左键空挥）/ 打它一下 | 认定为“想让它跟着”，眼神得对上才算 |
+
+命令行 / 外部程序想下指令，写一行到 `cmd.txt` 即可（执行后自动删除）：
+
+```
+ACT {"id":"1","name":"goto","args":{"x":100,"y":64,"z":200}}
+```
+
+结果覆盖写入 `act_out.json`，带 `id` 供配对。
+
+## 架构
+
+```
+玩家聊天 ──▶ play.js ──写──▶ chat_in.jsonl ──▶ mc_bridge.py ──调模型──▶ cmd.txt
+              ▲                                                        │
+              └───────────────── 执行动作 / say ◀───────────────────────┘
+```
+
+- **`play.js`** — 常驻 bot 本体：连接、重连、物理、寻路、动作注册表、自主行动循环、内存看门狗、文件指令通道。
+- **`mc_bridge.py`** — LLM 桥接：读新聊天 → 拼上下文与人格 → 调模型 → 写回指令。成功回复会 touch `.bridge_heartbeat`；
+  `play.js` 见心跳新鲜就关掉自己的本地闲聊规则（防止双回复），心跳过期自动回退。
+- **`craft_engine.js`** — 纯逻辑合成规划器：给定“要什么 + 有什么”，算出按什么顺序搓。配方直接取 `minecraft-data`，
+  烧炼表由调用方 `addRecipes()` 注入，所以加高炉 / 切石机 / 锻造台不用改规划器。
+
+## 目录
+
+```
+play.js              bot 主体（动作、自主行动、巡检、看门狗）
+mc_bridge.py         LLM 桥接（说话 / 决策 / token 记账 / 每日清理）
+craft_engine.js      通用合成规划器 + 测试 test_craft_engine.js
+start.sh             安全启动/重启（只认 node 跑的那个 play.js）
+watchdog.sh          单实例守护，异常退出自动拉起
+install_mineflayer.sh 一键环境安装（幂等）
+where.js             注册/登录并报位置
+drift.js             registry 漂移检测（baseline / check）
+chunk_scan.js        区块 stateId 全量扫描，找越界的 mod 方块
+skins/               皮肤生成与渲染脚本
+mc_usage/            token 账本（按天，运行时生成）
+```
+
+## token 记账
+
+每次 LLM 调用的 usage 追加到 `mc_usage/YYYY-MM-DD.jsonl`（一行一次，本地时区）。
+账本按天自清理，默认保留 90 天（`MC_USAGE_KEEP_DAYS` 可调）。
+`mc_usage.jsonl.migrated-*` 是旧单文件账本的留档，同样按保留期清理。
+
+## 一些坑（写在前面）
+
+- **冒险模式**：服务器每次上线会把 bot 设成冒险模式，此时所有放置/挖掘都会被拒。`play.js` 上线自检并自动切回生存。
+- **registry 里没有 block/item**：1.20.5+ 起方块和物品是静态注册，`registry_data` 包抓不到，
+  要判断服务器有没有 mod 方块，只能从区块里反推（见 `chunk_scan.js`）。
+- **别用旧版本的 state 基线**：1.21.11 原版是 1166 种方块 / 29671 个 state（0..29670），
+  拿别的版本数字（比如 1.20.6 的 26683）当基线会得出完全相反的结论。
+- **内存**：连续跑两天会把 heap 吃到 OOM。`start.sh` 里锁了 `--max-old-space-size=1024`，配合 `play.js` 的看门狗才稳。
+
+## License
+
+MIT

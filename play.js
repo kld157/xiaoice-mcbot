@@ -259,8 +259,10 @@ function startFollow(ms = 60000, preferName) {
         lastPos = me.clone();
         return;
       }
-      // 离得远就跑起来，贴近了就走
-      try { bot.setControlState('sprint', dist > 5); } catch (e) {}
+      // 离得远就跑起来，贴近了就走；追击模式（SPRINT.chase）贴到 2.5 格才收腿
+      const sprintFrom = SPRINT.chase ? 2.5 : 5;
+      if (dist > sprintFrom) feedForSprint();
+      setSprint(dist > sprintFrom);
 
 
       const yaw = Math.atan2(-dx, -dz);
@@ -737,6 +739,36 @@ async function pathWalk(tp, dist, timeout, opts = {}) {
   return ok;
 }
 
+// ---------- 疾跑 ----------
+// MC 规则：饱食度 ≤6 跑不动，水里/岩浆里也跑不动；跳起来那一瞬间疾跑会断。
+// 追人的时候最怕"按了 sprint 却不快"——所以统一走 sprintAllowed() 判断，饿了自动啃一口。
+const SPRINT = { chase: false, name: null, onAt: 0, ateAt: 0 };
+function sprintAllowed() {
+  try {
+    if (!bot || !bot.entity) return false;
+    if (typeof bot.food === 'number' && bot.food <= 6) return false;
+    if (bot.entity.isInWater || bot.entity.isInLava) return false;
+    return true;
+  } catch (e) { return false; }
+}
+// 关的时候永远允许（别把 sprint 卡死在 true 上）
+function setSprint(on) {
+  try {
+    if (on && !sprintAllowed()) return false;
+    bot.setControlState('sprint', !!on);
+    return !!on;
+  } catch (e) { return false; }
+}
+// 跑不动是因为饿：隔 4 秒补吃一次，别一边跑一边狂吃
+function feedForSprint() {
+  if (sprintAllowed()) return;
+  if (!bot || !bot.entity) return;
+  if (typeof bot.food === 'number' && bot.food > 6) return;   // 不是饿的问题（比如在水里）
+  if (Date.now() - (SPRINT.ateAt || 0) < 4000) return;
+  SPRINT.ateAt = Date.now();
+  try { eatSomething(); } catch (e) {}
+}
+
 // 走位：① 先试真寻路；② 不行再退回"朝目标按住前进"，卡住就跳/横挪
 async function walkTo(tp, dist = 2.6, timeout = 6000, opts = {}) {
   if (!tp || !isFinite(tp.x) || !isFinite(tp.y) || !isFinite(tp.z)) {
@@ -786,7 +818,8 @@ async function walkTo(tp, dist = 2.6, timeout = 6000, opts = {}) {
       const canStep = !waterAhead && (ground || (bot.entity.onGround && dy > -3.2 && dy < 2.2));
       bot.setControlState('forward', canStep && d > dist + 0.6);
 
-      bot.setControlState('sprint', !!opts.sprint);
+      if (opts.sprint) feedForSprint();
+      setSprint(!!opts.sprint);
       bot.setControlState('jump', !!(bot.entity.onGround && (dy > 0.8 || stuck > 0)));
       if (stuck === 1) { side = side ? -1 : 1; bot.setControlState(side > 0 ? 'left' : 'right', true); }
       else { bot.setControlState('left', false); bot.setControlState('right', false); }
@@ -1189,6 +1222,7 @@ actRegister('stop', () => {
   const wasPvp = PVP.active ? PVP.name : null;
   if (PVP.active) endPvp('stopped');
   stopFollow();
+  SPRINT.chase = false; SPRINT.name = null; setSprint(false);
   return { ok: true, msg: wasPvp ? `停下了，也跟 ${wasPvp} 收手了` : '停下了', extra: { building: BUILD.active, pvp: wasPvp } };
 });
 // 手动叫它重连：跟服务器脱节时最省事的一招（不用再 kill 进程）
@@ -1216,6 +1250,7 @@ actRegister('flags', () => ({
     pvp: { active: PVP.active, vs: PVP.name, skill: 'L' + PVP.skill + ' ' + PVP.cfg.name, stopHp: PVP.stopHp, hits: PVP.hits, whiffs: COMBAT.whiffs || 0, leftMs: PVP.active ? PVP.until - Date.now() : 0 },
     build: { active: BUILD.active, abort: BUILD.abort, abortQuiet: BUILD.abortQuiet, placed: BUILD.placed, failed: BUILD.failed },
     following: !!followTarget, followName: followTarget && followTarget.username, followLeftMs: followUntil - Date.now(),
+    sprint: { chase: !!SPRINT.chase, name: SPRINT.name, allowed: sprintAllowed(), food: typeof bot.food === 'number' ? bot.food : null, running: !!(bot.controlState && bot.controlState.sprint) },
     plugActive: typeof PLUG !== 'undefined' ? PLUG.active : null,
     drops: nearbyDrops(16).length,
   },
@@ -1223,6 +1258,45 @@ actRegister('flags', () => ({
 actRegister('jump', async () => {
   bot.setControlState('jump', true); await sleep(300); bot.setControlState('jump', false);
   return { ok: true, msg: '跳了一下' };
+});
+// 疾跑：sprint {player:"名字",ms} 追着人跑；sprint {on:true} 只开追击疾跑（跟着走时贴更近也跑）；sprint {on:false} 收腿
+actRegister('sprint', async (a) => {
+  a = a || {};
+  const mode = a.on !== undefined ? a.on : a.mode;
+  if (mode === false || /^(off|stop|false|0|停|关|不跑|别跑)$/i.test(String(mode || ''))) {
+    SPRINT.chase = false; SPRINT.name = null;
+    setSprint(false);
+    try { bot.setControlState('forward', false); } catch (e) {}
+    return { ok: true, msg: '疾跑收了～', extra: { chase: false } };
+  }
+  const p = a.player || a.target || a.who || null;
+  const ms = Math.max(2000, Math.min(30 * 60 * 1000, Number(a.ms || a.time || 0) || FOLLOW_MS));
+  SPRINT.chase = true; SPRINT.name = p || null; SPRINT.onAt = Date.now();
+  let following = !!followTarget;
+  if (p) {
+    following = !!startFollow(ms, p);
+    if (!following) return { ok: false, msg: `附近没看到 ${p} 呀` };
+  }
+  feedForSprint();                       // 饿了先啃一口，否则按了也跑不起来
+  let moved = null;
+  if (!following) {                      // 没在追人：自己蹬一小段，当场验证真的在跑
+    const p0 = bot.entity.position.clone();
+    try {
+      bot.setControlState('forward', true);
+      setSprint(true);
+      await sleep(Math.max(400, Math.min(2500, Number(a.run) || 700)));
+      bot.setControlState('forward', false);
+    } catch (e) {}
+    moved = +bot.entity.position.distanceTo(p0).toFixed(2);
+    setSprint(false);
+  }
+  const food = typeof bot.food === 'number' ? bot.food : null;
+  const can = sprintAllowed();
+  const msg = can
+    ? (`疾跑到位` + (following ? `，追着 ${p || '刚才那个人'}` : `，蹬了 ${moved} 格`) + `（饱食 ${food}/20）`)
+    : (`饱食 ${food}/20 太低或在水里，疾跑起不来${following ? '，我边吃边追' : ''}`);
+  log(`SPRINT on chase=true name=${SPRINT.name} following=${following} moved=${moved} food=${food} allowed=${can}`);
+  return { ok: can, msg, extra: { chase: true, following, moved, food, allowed: can } };
 });
 actRegister('goto', async (a) => {
   let target = null;
@@ -2877,7 +2951,9 @@ setInterval(() => {
     }
     try { bot.look(Math.atan2(-dx, -dz), 0, true); } catch (e) {}
     bot.setControlState('forward', true);
-    bot.setControlState('sprint', dist > (pvpCfg ? pvpCfg.sprintFrom : 4));
+    const sprintFromC = pvpCfg ? pvpCfg.sprintFrom : 4;
+    if (dist > sprintFromC) feedForSprint();       // 饿着追不上人，先补一口
+    setSprint(dist > sprintFromC);
     const moved = COMBAT.lastPos ? me.distanceTo(COMBAT.lastPos) : 1;
     COMBAT.lastPos = me.clone();
     if (moved < 0.06) COMBAT.stuck++; else COMBAT.stuck = 0;

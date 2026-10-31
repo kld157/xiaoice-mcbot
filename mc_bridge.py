@@ -61,6 +61,8 @@ PERSONA = (
     "「挖掉这个」→ dig；「放个方块在这」→ place；「缺料」→ collect；\n"
     "4) 工具返回失败（比如背包没方块）就照实说一句，并给个办法（让它丢方块/让我去挖）；\n"
     "5) 一次回复最多调 2-3 个工具，别无限循环。\n"
+    "6) 玩家说「和我PVP/来打一架/单挑/切磋」→ 调 pvp（默认 skill 3 收着打、血低就认输，绝不往死里打）；"
+    "对方明显不是在开玩笑、也没有明确拒绝被打，才用；自己血太少或在盖房子就说明一句再打。\n"
     "说话硬性要求：\n"
     "1) 每次只说 1 句话，最多 40 字，绝不换行；\n"
     "2) 不要引号、不要自称 AI、不要解释、不要加「回复：」这类前缀；\n"
@@ -114,6 +116,20 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "jump", "description": "原地跳一下（好玩/吸引注意）。",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "sprint", "description": "疾跑。带 player 就开着疾跑追那个人；不带就自己向前蹬一小段；on=false 关掉疾跑。",
+        "parameters": {"type": "object", "properties": {
+            "player": {"type": "string", "description": "追谁，可空"},
+            "on": {"type": "boolean", "description": "false = 关掉疾跑"},
+            "ms": {"type": "number", "description": "持续多久（毫秒），默认跟 follow 一样长"}}}}},
+    {"type": "function", "function": {
+        "name": "pvp",
+        "description": "接受玩家「和我PVP/来打一架/单挑」的邀请，跟玩家友好切磋：只打到认输血量就停，不会把人打死。对方没提要求就用默认值。",
+        "parameters": {"type": "object", "properties": {
+            "player": {"type": "string", "description": "对手名字，可空（默认最近的玩家）"},
+            "skill": {"type": "number", "description": "1 菜鸟到 5 不留余力，默认 3（会收着打）"},
+            "secs": {"type": "number", "description": "打多久，6-120 秒，默认 30"},
+            "stopHp": {"type": "number", "description": "自己血降到多少就认输，4-16，默认按档位"}}}}},
 ]
 
 FAST_ACTIONS = {"perceive", "inventory", "build_status", "say", "stop", "jump", "build_house", "follow"}
@@ -448,6 +464,8 @@ def send_action(name, args=None, timeout=None):
     args = args or {}
     if timeout is None:
         timeout = 8.0 if name in FAST_ACTIONS else 32.0
+        if name == "pvp":   # 对打要等打完（默认 30s，最长 120s）
+            timeout = max(30.0, min(120.0, float(args.get("secs") or 30)) + 25.0)
     aid = "%d" % (int(time.time() * 1000) % 10 ** 11)
     line = "ACT " + json.dumps({"id": aid, "name": name, "args": args}, ensure_ascii=False)
     if not write_raw(line, wait=min(10.0, timeout)):

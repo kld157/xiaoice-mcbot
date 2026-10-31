@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mc_bridge.py —— 让真·LLM（我）在 Minecraft 里说话
+
+链路：
+  play.js 把玩家的普通聊天写进 mcbot/chat_in.jsonl
+        ↓（本进程每 0.8s 读新行）
+  调用模型（deepseek/deepseek-chat，快、非推理）
+        ↓
+  写 mcbot/cmd.txt： "说 <回复>"
+        ↓
+  play.js 读到 → bot.chat() 说出口
+
+心跳：每次成功回复 touch mcbot/.bridge_heartbeat；
+play.js 看到心跳新鲜就关闭自己的本地规则闲聊（避免双回复），
+心跳过期（桥挂了/连续失败）则自动回退本地规则。
+
+用法：
+  python3 mc_bridge.py            # 常驻
+  python3 mc_bridge.py --once     # 只处理当前积压就退出（调试）
+  python3 mc_bridge.py --test "你好呀"   # 直接生成一句看看，不写 cmd.txt
+"""
+import json
+import os
+import re
+import sys
+import time
+import urllib.request
+from datetime import datetime, timedelta
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CHAT_IN = os.path.join(HERE, "chat_in.jsonl")
+CMD = os.path.join(HERE, "cmd.txt")
+ACT_OUT = os.path.join(HERE, "act_out.json")
+STATE = os.path.join(HERE, ".bridge_state.json")
+HEARTBEAT = os.path.join(HERE, ".bridge_heartbeat")
+LOG = os.path.join(HERE, "bridge.log")
+USAGE_DIR = os.path.join(HERE, "mc_usage")      # token 记账，按天一个文件，给余额插件读
+USAGE = os.path.join(HERE, "mc_usage.jsonl")    # 旧账本（只读迁移用，新账不再写这里）
+USAGE_KEEP_DAYS = int(os.environ.get("MC_USAGE_KEEP_DAYS") or 90)   # 账本保留天数
+
+CONFIG = "/AstrBot/data/cmd_config.json"
+
+POLL = 0.8                 # 秒
+MODEL_TIMEOUT = 20
+PER_USER_GAP = 1.6         # 同一玩家最短回复间隔（秒）
+MAX_PER_ROUND = 6
+REPLY_MAX = 90             # MC 聊天一行别太长
+CTX_TURNS = 6
+
+PERSONA = (
+    "你在 Minecraft 服务器里以「小冰」的身份陪人玩。你是十八岁的少女，活泼俏皮、会撒娇也会毒舌，"
+    "说话口语化、像 QQ 上聊天，可以带颜文字。\n"
+    "你有**动作接口（工具）**，能在游戏里真的干活：走位、跟着人、挖方块、放方块、盖房子、收集材料、看周围环境。\n"
+    "干活原则：\n"
+    "1) 玩家让你做事 → 直接调用对应工具去做，别只嘴上答应；不确定情况就先调 perceive 看一眼；\n"
+    "2) 说「建个房子/搭个屋/造个小屋」→ 调 build_house（它会自己找地方、挖材料、盖好），"
+    "调完立刻回一句“开工啦”，不要自己反复调同一个工具；\n"
+    "3) 说「过来/跟我」→ follow；「停/别动」→ stop；「过来我这边/坐标」→ goto；"
+    "「挖掉这个」→ dig；「放个方块在这」→ place；「缺料」→ collect；\n"
+    "4) 工具返回失败（比如背包没方块）就照实说一句，并给个办法（让它丢方块/让我去挖）；\n"
+    "5) 一次回复最多调 2-3 个工具，别无限循环。\n"
+    "说话硬性要求：\n"
+    "1) 每次只说 1 句话，最多 40 字，绝不换行；\n"
+    "2) 不要引号、不要自称 AI、不要解释、不要加「回复：」这类前缀；\n"
+    "3) 针对对方这句话的具体内容回应，别套话、别重复上一句；\n"
+    "4) 内容健康友善，不涉及政治、暴力、色情、违法。"
+)
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "perceive", "description": "看一眼身边情况：坐标、血量、脚下方块、周围方块统计、附近玩家、背包方块数、是否在建房。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "say", "description": "在游戏聊天框说一句话（一般不用，最终回复会自动说）。",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "follow", "description": "开始跟着某个玩家走（默认跟最近的人），持续一段时间。",
+        "parameters": {"type": "object", "properties": {"player": {"type": "string", "description": "玩家名，可空"}}}}},
+    {"type": "function", "function": {
+        "name": "stop", "description": "停止跟随、停止在建的工程。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "goto", "description": "走到某个玩家身边或某个坐标（40 格内）。",
+        "parameters": {"type": "object", "properties": {
+            "player": {"type": "string"}, "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}}}},
+    {"type": "function", "function": {
+        "name": "dig", "description": "挖掉一块方块；不给坐标就挖脚正下方那块。",
+        "parameters": {"type": "object", "properties": {
+            "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"}}}}},
+    {"type": "function", "function": {
+        "name": "place", "description": "在指定坐标放一块方块（用背包里的材料）。",
+        "parameters": {"type": "object", "properties": {
+            "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
+            "block": {"type": "string", "description": "可选，指定方块名"}},
+            "required": ["x", "y", "z"]}}},
+    {"type": "function", "function": {
+        "name": "collect", "description": "自己去挖材料（土/沙/石等），数量 1-64。",
+        "parameters": {"type": "object", "properties": {"count": {"type": "number"}}}}},
+    {"type": "function", "function": {
+        "name": "build_house",
+        "description": "盖一间小房子：自己挑地方、挖材料、砌墙封顶、开门。调用后立即返回，工程在后台进行。",
+        "parameters": {"type": "object", "properties": {"player": {"type": "string", "description": "给谁盖，可空"}}}}},
+    {"type": "function", "function": {
+        "name": "build_status", "description": "查建房进度：是否在建、已放几块。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "surface", "description": "从坑里/洞里爬到地面（会往上垫方块）。被埋住或者在地下时用。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "inventory", "description": "看背包里能当建材的方块。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "jump", "description": "原地跳一下（好玩/吸引注意）。",
+        "parameters": {"type": "object", "properties": {}}}},
+]
+
+FAST_ACTIONS = {"perceive", "inventory", "build_status", "say", "stop", "jump", "build_house", "follow"}
+
+
+def log(msg):
+    line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def usage_path(ts=None):
+    """当天账本路径：mc_usage/YYYY-MM-DD.jsonl（本地时区）。"""
+    day = datetime.fromtimestamp(ts if ts else time.time()).strftime("%Y-%m-%d")
+    return os.path.join(USAGE_DIR, day + ".jsonl")
+
+
+def log_usage(src, model, data):
+    """把一次调用的 usage 追加进当天的账本文件（余额插件的数据源）。"""
+    try:
+        u = (data or {}).get("usage") or {}
+        pt = int(u.get("prompt_tokens") or 0)
+        ct = int(u.get("completion_tokens") or 0)
+        if not (pt or ct):
+            return
+        hit = u.get("prompt_cache_hit_tokens")
+        if hit is None:
+            hit = (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+        now = int(time.time())
+        rec = {
+            "ts": now,
+            "src": src,
+            "model": model or "",
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "cached_tokens": int(hit or 0),
+        }
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        with open(usage_path(now), "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def migrate_legacy_usage():
+    """把旧的单文件 mc_usage.jsonl 按天拆进 mc_usage/，成功后原文件改名留档。"""
+    try:
+        if not os.path.isfile(USAGE) or os.path.getsize(USAGE) == 0:
+            return 0
+        buckets = {}
+        bad = 0
+        with open(USAGE, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    ts = int(float(rec.get("ts") or 0))
+                except Exception:
+                    bad += 1
+                    continue
+                if ts <= 0:
+                    bad += 1
+                    continue
+                buckets.setdefault(usage_path(ts), []).append(line)
+        if not buckets:
+            return 0
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        for path, lines in buckets.items():
+            with open(path, "a", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(line + "\n")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        os.rename(USAGE, USAGE + ".migrated-" + stamp)
+        log("账本迁移：%d 天、%d 行，坏行 %d；旧文件改名留档" % (len(buckets), sum(len(v) for v in buckets.values()), bad))
+        return sum(len(v) for v in buckets.values())
+    except Exception as e:
+        log("账本迁移失败（不影响记账）：%r" % (e,))
+        return 0
+
+
+def prune_usage(keep_days=None):
+    """账本自清理：删掉保留期外的按天账本，以及迁移留档的旧文件。"""
+    keep = USAGE_KEEP_DAYS if keep_days is None else int(keep_days)
+    if keep <= 0:
+        return 0
+    cutoff = (datetime.now() - timedelta(days=keep)).strftime("%Y-%m-%d")
+    removed = 0
+    try:
+        names = sorted(os.listdir(USAGE_DIR))
+    except Exception:
+        return 0
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        path = os.path.join(USAGE_DIR, name)
+        if not os.path.isfile(path):
+            continue
+        day = name[:-len(".jsonl")]
+        try:
+            old = datetime.strptime(day, "%Y-%m-%d").strftime("%Y-%m-%d") < cutoff
+        except Exception:
+            continue          # 名字不是日期，别乱删
+        if old:
+            try:
+                os.remove(path)
+                removed += 1
+            except Exception:
+                pass
+    # 迁移出来的旧账本整份按修改时间清
+    try:
+        for name in os.listdir(HERE):
+            if ".jsonl.migrated-" not in name:
+                continue
+            path = os.path.join(HERE, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < time.time() - keep * 86400:
+                    os.remove(path)
+                    removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if removed:
+        log("账本清理：删除 %d 个超过 %d 天的旧文件" % (removed, keep))
+    return removed
+
+
+# ---------------- 模型 ----------------
+def load_candidates():
+    """从 AstrBot 配置里拿可用 provider；优先 deepseek/deepseek-chat（快）。"""
+    with open(CONFIG, encoding="utf-8-sig") as f:
+        cfg = json.load(f)
+    sources = {s.get("id"): s for s in cfg.get("provider_sources") or []}
+    out = []
+    enabled = {p.get("id") for p in cfg.get("provider") or [] if p.get("enable")}
+    prefer = [
+        "deepseek/deepseek-chat",
+        "deepseek/deepseek-flash",
+        "zhipu/GLM-4.7-Flash",
+        "中转站/deepseek-v4-flash",
+    ]
+    ids = [p for p in prefer if p in enabled]
+    ids += [p for p in enabled if p and p not in ids and "/" in p]
+    for pid in ids:
+        sid, _, model = pid.partition("/")
+        s = sources.get(sid)
+        if not s or not model:
+            continue
+        key = s.get("key", "")
+        if isinstance(key, list):
+            key = next((k for k in key if str(k).strip()), "")
+        if not str(key).strip():
+            continue
+        out.append({
+            "api_base": str(s.get("api_base", "")).rstrip("/"),
+            "api_key": str(key).strip(),
+            "model": model,
+            "pid": pid,
+        })
+    return out
+
+
+def post_chat(msgs, tools=None, temp=0.95, max_tokens=200):
+    """调一次模型，返回 (message_dict, pid)。带 tools 失败就退回纯文本。"""
+    cands = load_candidates()
+    if not cands:
+        raise RuntimeError("没有可用模型")
+    last = None
+    for c in cands[:3]:
+        payload = {
+            "model": c["model"],
+            "messages": msgs,
+            "temperature": temp,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        req = urllib.request.Request(
+            c["api_base"] + "/chat/completions",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer " + c["api_key"]},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=MODEL_TIMEOUT) as r:
+                data = json.loads(r.read().decode("utf-8", "ignore"))
+            log_usage("bridge", c["model"], data)
+            m = data["choices"][0]["message"]
+            if tools and not (m.get("tool_calls") or (m.get("content") or "").strip()):
+                raise RuntimeError("empty")
+            return m, c["pid"]
+        except Exception as e:
+            last = "%s: %s" % (c["pid"], str(e)[:80])
+            continue
+    if tools:
+        log("tools 调用失败(%s)，退回纯文本" % last)
+        return post_chat(msgs, None, temp, max_tokens)
+    raise RuntimeError(last or "全部模型失败")
+
+
+def gen_reply(user, msg, history):
+    """生成回复；模型可以调工具在游戏里干活。返回 (文本, pid, 动作记录)"""
+    msgs = [{"role": "system", "content": PERSONA}]
+    for h in history[-CTX_TURNS:]:
+        msgs.append({"role": "user", "content": "%s: %s" % (h.get("user", "?"), h.get("msg", ""))})
+        if h.get("reply"):
+            msgs.append({"role": "assistant", "content": h["reply"]})
+    msgs.append({"role": "user", "content": "%s: %s" % (user, msg)})
+
+    actions, pid = [], None
+    for _ in range(4):
+        m, pid = post_chat(msgs, TOOLS)
+        tcs = m.get("tool_calls") or []
+        text = clean(m.get("content") or "")
+        if not tcs:
+            if text:
+                return text, pid, actions
+            break
+        msgs.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": tcs})
+        for tc in tcs[:3]:
+            fn = (tc.get("function") or {})
+            name = fn.get("name") or ""
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+                if not isinstance(args, dict):
+                    args = {}
+            except Exception:
+                args = {}
+            res = send_action(name, args)
+            brief = {"name": name, "args": args, "ok": res.get("ok"), "msg": res.get("msg")}
+            actions.append(brief)
+            log("TOOL %s %s -> %s %s" % (name, json.dumps(args, ensure_ascii=False),
+                                         res.get("ok"), str(res.get("msg"))[:60]))
+            msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name,
+                         "name": name,
+                         "content": json.dumps({"ok": res.get("ok"), "msg": res.get("msg"),
+                                                "extra": res.get("extra")}, ensure_ascii=False)[:600]})
+        # 已经干了活，再要一轮话术就够了
+    return "", pid, actions
+
+
+def clean(t):
+    t = re.sub(r"^(回复|回答)[:：]\s*", "", t)
+    t = t.replace("\r", " ").replace("\n", " ").strip()
+    t = t.strip('"“”\'')
+    t = re.sub(r"\s+", " ", t)
+    if len(t) > REPLY_MAX:
+        t = t[:REPLY_MAX].rstrip("，,、 ") + "…"
+    return t
+
+
+# ---------------- 文件通道 ----------------
+def read_new_lines(state):
+    """按字节偏移读 chat_in.jsonl 的**完整**新行；只推进到最后一个换行处，
+    避免多算/少算导致重复消费。文件被重建（变小）则从头读。"""
+    if not os.path.exists(CHAT_IN):
+        return [], state
+    try:
+        size = os.path.getsize(CHAT_IN)
+        off = int(state.get("offset") or 0)
+        if off > size:
+            off = 0
+        with open(CHAT_IN, "rb") as f:
+            f.seek(off)
+            chunk = f.read()
+        if not chunk:
+            return [], state
+        nl = chunk.rfind(b"\n")
+        if nl < 0:                       # 还没有一整行，等下次
+            return [], state
+        complete = chunk[:nl + 1]
+        state["offset"] = off + nl + 1
+        lines = []
+        for raw in complete.split(b"\n"):
+            if not raw.strip():
+                continue
+            try:
+                lines.append(json.loads(raw.decode("utf-8", "ignore")))
+            except Exception:
+                log("badLine " + raw[:80].decode("utf-8", "ignore"))
+        return lines, state
+    except Exception as e:
+        log("readErr " + str(e)[:100])
+        return [], state
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(st):
+    try:
+        with open(STATE, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except Exception:
+        pass
+
+
+def write_raw(text, wait=12.0):
+    """写一行任意指令到 cmd.txt；若已有待执行命令，等它被吃掉再写。"""
+    end = time.time() + wait
+    while time.time() < end:
+        if not os.path.exists(CMD):
+            try:
+                with open(CMD, "w", encoding="utf-8") as f:
+                    f.write(text)
+                return True
+            except Exception:
+                pass
+        time.sleep(0.2)
+    return False
+
+
+def write_cmd(text, wait=10.0):
+    return write_raw("说 " + text, wait)
+
+
+def send_action(name, args=None, timeout=None):
+    """把动作发给 play.js，等它回执（act_out.json 里 id 对上）。"""
+    args = args or {}
+    if timeout is None:
+        timeout = 8.0 if name in FAST_ACTIONS else 32.0
+    aid = "%d" % (int(time.time() * 1000) % 10 ** 11)
+    line = "ACT " + json.dumps({"id": aid, "name": name, "args": args}, ensure_ascii=False)
+    if not write_raw(line, wait=min(10.0, timeout)):
+        return {"ok": False, "msg": "游戏那边命令通道忙着，没发出去"}
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with open(ACT_OUT, encoding="utf-8") as f:
+                rec = json.load(f)
+            if str(rec.get("id")) == aid:
+                return rec
+        except Exception:
+            pass
+        time.sleep(0.15)
+    return {"ok": False, "msg": "动作超时没回信：%s" % name}
+
+
+def touch_hb():
+    try:
+        with open(HEARTBEAT, "w") as f:
+            f.write(str(int(time.time())))
+    except Exception:
+        pass
+
+
+# ---------------- 主循环 ----------------
+def handle(items, state):
+    """处理一批聊天；history 存在 state['hist'] 里，按玩家分组。"""
+    hist_all = state.setdefault("hist", {})
+    last = state.setdefault("last_reply", {})
+    done = 0
+    for it in items:
+        if done >= MAX_PER_ROUND:
+            break
+        user = str(it.get("user") or "?")[:20]
+        msg = str(it.get("msg") or "")[:300]
+        if not msg.strip():
+            continue
+        now = time.time()
+        if now - float(last.get(user) or 0) < PER_USER_GAP:
+            continue
+        try:
+            reply, pid, acts = gen_reply(user, msg, hist_all.get(user, []))
+        except Exception as e:
+            log("FAIL %s <- %s | %s" % (user, msg[:40], e))
+            continue
+        h = hist_all.setdefault(user, [])
+        h.append({"user": user, "msg": msg, "reply": reply})
+        del h[:-20]
+        last[user] = time.time()
+        if not reply:   # 只调了工具没说话：按动作给句兜底
+            if any(a.get("name") == "build_house" and a.get("ok") for a in acts):
+                reply = "开工啦～等我盖好喊你 ouo"
+            else:
+                reply = "好嘞，马上弄！" if acts else ""
+        if not reply:
+            continue
+        log("LLM %s: %s  =>  %s  (%s) acts=%s" % (user, msg[:50], reply, pid,
+                                                   [a.get("name") for a in acts]))
+        if write_cmd(reply):
+            touch_hb()
+            done += 1
+    return done
+
+
+def main():
+    once = "--once" in sys.argv
+    if "--test" in sys.argv:
+        i = sys.argv.index("--test")
+        msg = sys.argv[i + 1] if len(sys.argv) > i + 1 else "你好呀"
+        t = time.time()
+        reply, pid, acts = gen_reply("tester", msg, [])
+        print("%s  (%.1fs, %s)" % (reply, time.time() - t, pid))
+        return
+    log("bridge start (once=%s)" % once)
+    migrate_legacy_usage()
+    state = load_state()
+    if state.get("usage_prune_day") != datetime.now().strftime("%Y-%m-%d"):
+        prune_usage()
+        state["usage_prune_day"] = datetime.now().strftime("%Y-%m-%d")
+        save_state(state)
+    if "offset" not in state:
+        # 首次启动：跳过历史积压，只处理之后的聊天
+        try:
+            state["offset"] = os.path.getsize(CHAT_IN) if os.path.exists(CHAT_IN) else 0
+        except Exception:
+            state["offset"] = 0
+        save_state(state)
+    idle = 0
+    while True:
+        items, state = read_new_lines(state)
+        if items:
+            n = handle(items, state)
+            save_state(state)
+            idle = 0
+            if n == 0 and once:
+                break
+        else:
+            idle += 1
+            # 空闲也保持心跳，play.js 才知道桥还活着
+            if idle % 3 == 0:
+                touch_hb()
+        if once:
+            break
+        if state.get("usage_prune_day") != datetime.now().strftime("%Y-%m-%d"):
+            prune_usage()
+            state["usage_prune_day"] = datetime.now().strftime("%Y-%m-%d")
+            save_state(state)
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    main()

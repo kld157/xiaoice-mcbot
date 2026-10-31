@@ -1,0 +1,35 @@
+# ==== 密钥 / 隐私（绝对别上传）====
+llm.json
+.bridge_state.json
+.bridge_heartbeat
+chat_in.jsonl
+act_out.json
+.bili_cookies.json
+
+# ==== 运行时状态 ====
+*.pid
+*.lock
+.play.lock
+watchdog.pid
+mc_usage/
+mc_usage.jsonl
+mc_usage.jsonl.*
+baseline*.json
+
+# ==== 日志 ====
+*.log
+*.log.*
+
+# ==== 大文件 / 备份 ====
+play.js.bak*
+*.bak*
+archive/
+
+# ==== 依赖 & 缓存 ====
+node_modules/
+__pycache__/
+*.pyc
+
+# ==== 系统 ====
+.DS_Store
+Thumbs.db

@@ -1100,6 +1100,12 @@ actRegister('stop', () => {
   stopFollow();
   return { ok: true, msg: '停下了', extra: { building: BUILD.active } };
 });
+// 手动叫它重连：跟服务器脱节时最省事的一招（不用再 kill 进程）
+actRegister('resync', (a) => {
+  LAST_RESYNC = 0; DRIFT_SCORE = 0;
+  const ok = requestResync((a && a.reason) || '手动要求');
+  return { ok, msg: ok ? '好，我断线重连一下，回来说话' : '这会儿不方便重连（刚连过）' };
+});
 // 只读内窥镜：查各种全局忙/卡标志，别再靠猜（10-31 pickup 捡不动、collect 挖 0 块的排查）
 actRegister('flags', () => ({
   ok: true,
@@ -1151,7 +1157,14 @@ actRegister('dig', async (a) => {
   let b;
   const hasXYZ = (a.x !== undefined && a.y !== undefined && a.z !== undefined);
   if (hasXYZ) b = bot.blockAt(new Vec3(Math.floor(+a.x), Math.floor(+a.y), Math.floor(+a.z)));
-  else b = bot.blockAt(bot.entity.position.offset(0, -1, 0));
+  else {
+    b = bot.blockAt(bot.entity.position.offset(0, -1, 0));
+    // 脚下是空气（站在半空里、方块刚被自己挖掉）就别干瞪眼了，就近找一块能挖的
+    if (!b || b.name === 'air' || b.boundingBox === 'empty') {
+      const alt = nearestDiggable(bot.entity.position.offset(0, -1, 0), 3);
+      if (alt) { b = alt; log('DIG 脚下没方块，改挖附近 ' + alt.name + ' @' + alt.position.toString()); }
+    }
+  }
   if (!b) return { ok: false, msg: '那儿没方块' };
   if (hasXYZ && b.name === 'air') {
     // 坐标偏了一点就自己找最近的能挖的方块，别干瞪眼
@@ -1217,6 +1230,7 @@ actRegister('place', async (a) => {
   const d = bot.entity.position.distanceTo(spot);
   if (d > 4.4) return { ok: false, msg: `还差 ${d.toFixed(1)} 格，够不着`, extra: { mats: matCount(), why: 'far', dist: +d.toFixed(1) } };
   const ok = await placeAt(spot);
+  if (!ok) driftTick('放置被服务器拒了（客户端以为空）', 1);   // 我们眼里是空气、服务器眼里有东西 → 漂移证据
   return {
     ok,
     msg: ok
@@ -2321,6 +2335,15 @@ async function pickUpNearby(maxD = 9, opt = {}) {
       if (st.n >= 3) {
         st.skipUntil = Date.now() + 120000;
         log('PICKUP skip id=' + id + ' (' + String(it.e.name || it.e.displayName || '?') + ') 试' + st.n + '次没到手 d=' + d.toFixed(2) + ' dy=' + dy.toFixed(2) + '，晾2分钟');
+        if (!opt.force) {
+          st.ghost = (st.ghost || 0) + 1;
+          if (st.ghost >= 2) {
+            // 两轮共 6 次都进不了背包（有的甚至就在脚边 2 格）→ 服务器那边其实没这东西，别追了
+            st.skipUntil = Date.now() + 3600000;
+            log('PICKUP 幽灵实体 id=' + id + ' 两轮都没到手，1 小时内不再追');
+            driftTick('掉落物捡不进包（疑似幽灵实体）', 1);
+          }
+        }
         st.n = 0;
       }
     }
@@ -3184,6 +3207,40 @@ function withTimeout(p, ms, tag) {
   return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('超时:' + tag)), ms))]);
 }
 
+// ---------- 客户端状态漂移自愈 ----------
+// 症状：合成一直超时（服务器不理我们的窗口点击）、放置被服务器静默拒、掉落物看得见却怎么走都捡不进背包。
+// 这不是配方/坐标问题，是客户端的世界和背包快照跟服务器"对不上账"了——干净重连一次就全恢复
+// （2026-10-31 实测：重启前后同一套动作，重启前 craft 超时/place 被拒，重启后 craft 4 块木板、放方块、挖石头全成功）。
+// 所以别再逐个功能打补丁了：攒够证据就自己重连，重连逻辑走 bot.on('end') 那条老路。
+let LAST_RESYNC = 0;
+let DRIFT_SCORE = 0;
+let DRIFT_AT = 0;
+const DRIFT_WINDOW = 10 * 60 * 1000;   // 10 分钟内的失败才算同一批证据
+const DRIFT_LIMIT = 3;                 // 攒到 3 分就重连
+function driftTick(reason, weight) {
+  const now = Date.now();
+  if (!DRIFT_AT || now - DRIFT_AT > DRIFT_WINDOW) DRIFT_SCORE = 0;
+  DRIFT_AT = now;
+  DRIFT_SCORE += (weight || 1);
+  log(`DRIFT ${DRIFT_SCORE}/${DRIFT_LIMIT}：${reason}`);
+  if (DRIFT_SCORE >= DRIFT_LIMIT) requestResync(reason);
+}
+function requestResync(reason) {
+  const now = Date.now();
+  if (now - LAST_RESYNC < 5 * 60 * 1000) return false;   // 5 分钟内只重连一次，别疯狂敲门
+  if (!bot || !bot._client) return false;
+  LAST_RESYNC = now; DRIFT_SCORE = 0;
+  log('RESYNC 我重连一下（' + reason + '）——客户端跟服务器脱节了，不是我不会做');
+  try { bot._client.end('resync'); } catch (e) { try { bot.quit('resync'); } catch (e2) {} }
+  return true;
+}
+// 合成/开箱留下的窗口要收干净：窗口 id 对不上时服务器会把点击当噪音丢掉，然后我们就干等到超时
+async function tidyWindows() {
+  try {
+    if (bot && bot.currentWindow && bot.currentWindow !== bot.inventory) await bot.closeWindow(bot.currentWindow);
+  } catch (e) {}
+}
+
 function itemDefOf(n) {
   try { return bot.registry.itemsByName[n] || null; } catch (e) { return null; }
 }
@@ -3367,11 +3424,23 @@ async function craftOne(step) {
   }
   try {
     log(`CRAFT ${step.name} x${step.times} table=${!!table} inputs=${JSON.stringify(step.inputs)}`);
-    await withTimeout(bot.craft(r, step.times, table || null), 9000, 'craft');
+    await tidyWindows();                                  // 先把上次没关的窗口收拾掉
+    try {
+      await withTimeout(bot.craft(r, step.times, table || null), 9000, 'craft');
+    } catch (e1) {
+      // 第一次不成就收拾干净再来一次：残留窗口/失效的工作台引用都可能是原因
+      log(`合成 ${step.name} 第一次失败：${e1 && e1.message}，收拾窗口重试`);
+      await tidyWindows();
+      await bot.waitForTicks(4);
+      if (table) { const t2 = await ensureTable(); if (t2) table = t2; }
+      await withTimeout(bot.craft(r, step.times, table || null), 7000, 'craft-retry');
+    }
     await bot.waitForTicks(3);
     return true;
   } catch (e) {
     log(`合成 ${step.name} 失败：${e && e.message}`);
+    // 重试都没等到服务器回话 —— 这不是配方问题，是状态漂移，记一笔
+    if (/超时|timeout|transaction|didn't respond/i.test(String(e && e.message))) driftTick('合成没回音', 2);
     return false;
   }
 }
@@ -3758,6 +3827,7 @@ const AUTO_MENU_LIST = [
   ['collect', '在附近采集能当砖的方块，args: {count}'],
   ['pickup', '把附近的掉落物捡了'],
   ['eat', '吃点背包里的东西垫肚子'],
+  ['chest', '存/取/看箱子（清背包唯一有效的办法，toss 会被服务器回滚），args: {mode:"store|take|list", items:[...], preset:"junk"}'],
   ['armor', '换上背包里最好的护甲'],
   ['craft', '搓东西（木板/木棍/工作台/工具武器都行），args: {item:"英文id", count}；没工作台会自己搓一张摆上'],
   ['attack', '打附近的怪（自动换武器/追击/跳劈），args: {count 最多几只(默认2), secs 最多打几秒(默认15)}'],
@@ -4014,6 +4084,121 @@ actRegister('toss', async (a) => {
     return { ok: tossed > 0, msg: `扔掉了 ${tossed} 个 ${want}，还剩 ${after}`, extra: { item: want, tossed, left: after } };
   } catch (e) {
     return { ok: false, msg: '扔东西失败：' + ((e && e.message) || e), extra: { item: want, tossed } };
+  }
+});
+
+// ---------- 容器存取：toss 被服务器回滚，清背包只能靠「存进箱子」 ----------
+const CONTAINER_NAMES = ['chest', 'trapped_chest', 'barrel'];
+const JUNK_PRESET = ['red_mushroom', 'rotten_flesh', 'phantom_membrane', 'leaf_litter', 'gunpowder',
+  'bone', 'string', 'arrow', 'lead', 'copper_leggings', 'copper_helmet', 'copper_boots',
+  'copper_chestplate', 'dark_oak_sapling', 'dirt'];
+function findChestBlock(r = 8) {
+  try {
+    const ids = CONTAINER_NAMES.map((n) => bot.registry.blocksByName[n] && bot.registry.blocksByName[n].id)
+      .filter((x) => x !== undefined && x !== null);
+    if (!ids.length) return null;
+    return bot.findBlock({ matching: ids, maxDistance: r }) || null;
+  } catch (e) { return null; }
+}
+async function placeItemAt(itemName, p) {
+  // 用「指定物品」放方块（placeAt 只会用土），成功与否看目标格是否真变成方块
+  const it = bot.inventory.items().find((i) => i.name === itemName || i.name === 'minecraft:' + itemName);
+  if (!it) return false;
+  const offs = [[0, -1, 0], [0, 1, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1],
+                [1, -1, 0], [-1, -1, 0], [0, -1, 1], [0, -1, -1]];
+  for (const [ox, oy, oz] of offs) {
+    const rb = bot.blockAt(new Vec3(p.x + ox, p.y + oy, p.z + oz));
+    if (!rb || rb.boundingBox !== 'block') continue;
+    try {
+      await bot.equip(it, 'hand');
+      await bot.placeBlock(rb, new Vec3(-ox, -oy, -oz));
+      await bot.waitForTicks(4);
+      const after = bot.blockAt(p);
+      if (after && after.boundingBox === 'block' && after.name !== 'air') return true;
+    } catch (e) { log('chestPlaceErr ' + (e.message || e)); continue; }
+  }
+  return false;
+}
+actRegister('chest', async (a) => {
+  // 存/取/看箱子。mode: store(默认) | take | list    items:[...] 或 item:"x"
+  if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };
+  const mode = String((a && a.mode) || 'store').toLowerCase();
+  let names = Array.isArray(a && a.items) ? a.items.map((s) => String(s).toLowerCase())
+    : (a && a.item ? [String(a.item).toLowerCase()] : []);
+  if ((a && a.preset) === 'junk' || (mode === 'store' && !names.length)) names = JUNK_PRESET.slice();
+  names = names.map((n) => n.replace(/^minecraft:/, ''));
+
+  let block = findChestBlock(8);
+  let placedAt = null;
+  if (!block && mode !== 'list') {
+    const have = CONTAINER_NAMES.find((n) => invCountOf(n) > 0);
+    if (!have) return { ok: false, msg: '背包里没有箱子/木桶，没法开容器', extra: { why: 'no_container_item' } };
+    const spot = findFreePlaceSpot(bot.entity.position.floored().offset(1, 0, 0), 4) || findOpenStand(4);
+    if (!spot) return { ok: false, msg: '附近找不到能放箱子的空地', extra: { why: 'no_spot' } };
+    if (!nearEnough(spot)) await walkTo(spot, 2.8, 6000);
+    const done = await placeItemAt(have, spot);
+    if (!done) return { ok: false, msg: `箱子放不上去（被服务器拒了或位置悬空）`, extra: { why: 'place_failed', at: [spot.x, spot.y, spot.z] } };
+    placedAt = [spot.x, spot.y, spot.z];
+    await sleep(300);
+    block = bot.blockAt(spot);
+    if (!block || block.boundingBox === 'empty') block = findChestBlock(8);
+  }
+  if (!block) return { ok: false, msg: '附近没找到箱子（先用 store 放一个）', extra: { why: 'no_chest', placedAt } };
+
+  let cont;
+  try { cont = await bot.openContainer(block); } catch (e) {
+    return { ok: false, msg: '打不开箱子：' + ((e && e.message) || e), extra: { why: 'open_failed', placedAt } };
+  }
+  try {
+    const chestSlots = Math.max(0, cont.slots.length - 36);
+    const inside = cont.containerItems() || [];
+    const usedSlots = inside.length;
+    const describe = () => (cont.containerItems() || []).map((i) => `${i.name}x${i.count}`).join(',') || '空';
+
+    if (mode === 'list') {
+      return { ok: true, msg: `箱子里有 ${usedSlots}/${chestSlots} 格：${describe()}`, extra: { placedAt, chestSlots, usedSlots, inside: inside.map((i) => ({ name: i.name, count: i.count })) } };
+    }
+
+    const moved = {};
+    const skipped = [];
+    if (mode === 'take') {
+      for (const nm of names) {
+        const have = (cont.containerItems() || []).filter((i) => i.name === nm);
+        let got = 0;
+        for (const st of have) {
+          try { await cont.withdraw(st.type, null, st.count); got += st.count; } catch (e) { break; }
+        }
+        if (got) moved[nm] = got; else skipped.push(nm);
+      }
+      return { ok: Object.keys(moved).length > 0, msg: `取出 ${Object.entries(moved).map(([k, v]) => k + 'x' + v).join(',') || '啥也没取到'}${skipped.length ? '（箱子里没有：' + skipped.join(',') + '）' : ''}`, extra: { moved, skipped, placedAt } };
+    }
+
+    // store：能塞多少塞多少，塞不下就报「箱子满了」
+    let full = false;
+    for (const nm of names) {
+      if (full) { skipped.push(nm); continue; }
+      const stacks = bot.inventory.items().filter((i) => i.name === nm);
+      if (!stacks.length) { skipped.push(nm); continue; }
+      let n = 0;
+      for (const st of stacks) {
+        try { await cont.deposit(st.type, null, st.count); n += st.count; } catch (e) { full = true; break; }
+      }
+      if (n) moved[nm] = n;
+      await bot.waitForTicks(2);
+    }
+    const freed = bot.inventory.items().length;
+    return {
+      ok: Object.keys(moved).length > 0,
+      msg: (Object.keys(moved).length ? `存进箱子：${Object.entries(moved).map(([k, v]) => k + 'x' + v).join(',')}` : '啥也没存进去')
+        + (skipped.length ? `；没动：${skipped.join(',')}` : '')
+        + (full ? '（箱子满了）' : '')
+        + `；箱子 ${(cont.containerItems() || []).length}/${chestSlots} 格，背包占用 ${freed} 格`,
+      extra: { moved, skipped, placedAt, chestSlots, usedSlots: (cont.containerItems() || []).length, invUsed: freed },
+    };
+  } catch (e) {
+    return { ok: false, msg: '存取箱子出错：' + ((e && e.message) || e), extra: { placedAt } };
+  } finally {
+    try { cont.close(); } catch (e) {}
   }
 });
 

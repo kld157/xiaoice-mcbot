@@ -4390,7 +4390,7 @@ actRegister('pvp', async (a) => {
   const cfg = PVP_SKILLS[skill];
   const secs = Math.max(6, Math.min(120, Number(a.secs || 30)));
   const stopHp = a.stopHp != null ? Math.max(4, Math.min(16, Number(a.stopHp))) : cfg.stopHp;
-  const t = findPlayer(a.player || a.name || '');
+  const t = findPlayer(a.player || a.name || a.target || a.who || '');
   if (!t) {
     return { ok: false, msg: a.player ? `没看到 ${a.player}，他大概不在线或不在这附近` : '附近没别的玩家可以打' };
   }

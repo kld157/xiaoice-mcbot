@@ -2306,7 +2306,7 @@ function normalizeSkill(v, fallback) {
   return s;
 }
 
-const PVP = { active: false, target: null, name: null, until: 0, stopHp: 8, hits: 0, since: 0, skill: 3, cfg: PVP_SKILLS[3], minDist: Infinity };
+const PVP = { active: false, target: null, name: null, until: 0, stopHp: 8, hits: 0, maxHits: 0, since: 0, skill: 3, cfg: PVP_SKILLS[3], minDist: Infinity };
 
 // ---------- 公平开局：有 OP 就"双方各发一份"，没 OP 就谁都别用 ----------
 // 跟人打着玩之前先把牌面拉平，别拿一身 buff 欺负人家。
@@ -4466,6 +4466,8 @@ actRegister('pvp', async (a) => {
   const cfg = PVP_SKILLS[skill];
   const secs = Math.max(6, Math.min(120, Number(a.secs || 30)));
   const stopHp = a.stopHp != null ? Math.max(4, Math.min(16, Number(a.stopHp))) : cfg.stopHp;
+  // hits=n：砍够 n 刀就收手（客户端拿不到对手血量，只能数自己的刀数当"打到哪了"的估算）
+  const maxHits = Math.max(0, Math.min(60, parseInt(a.hits != null ? a.hits : a.maxHits, 10) || 0));
   const t = findPlayer(a.player || a.name || a.target || a.who || '');
   if (!t) {
     return { ok: false, msg: a.player ? `没看到 ${a.player}，他大概不在线或不在这附近` : '附近没别的玩家可以打' };
@@ -4479,7 +4481,7 @@ actRegister('pvp', async (a) => {
   PVP.active = true; PVP.target = t; PVP.name = nm;
   PVP.skill = skill; PVP.cfg = cfg;
   PVP.stopHp = stopHp; PVP.until = Date.now() + secs * 1000;
-  PVP.since = Date.now(); PVP.hits = 0; PVP.minDist = d0;
+  PVP.since = Date.now(); PVP.hits = 0; PVP.maxHits = maxHits; PVP.minDist = d0;
 
   COMBAT.cool = 0; fleeing = false;
   COMBAT.target = t; COMBAT.active = true; COMBAT.since = Date.now();
@@ -4529,6 +4531,7 @@ actRegister('pvp', async (a) => {
     if (!PVP.active) { why = 'stopped'; break; }
     if (PVP.target !== t || t.isValid === false || !t.position) { why = 'target_gone'; break; }
     if (bot.health <= stopHp) { why = 'low_hp'; break; }
+    if (PVP.maxHits && PVP.hits >= PVP.maxHits) { why = 'hit_cap'; break; }
   }
   const hp = Math.round(bot.health);
   const hits = PVP.hits, died = !(bot.health > 0);
@@ -4539,12 +4542,14 @@ actRegister('pvp', async (a) => {
   if (why === 'low_hp' || died) say('哎呀哎呀打不过，我认输！');
   else if (why === 'target_gone') say(`${nm} 你跑哪去啦～`);
   else if (why === 'timeout') say('呼…手都酸了，算平手吧，都不许再动手哦！');
+  else if (why === 'hit_cap') say(`${nm} 停停停！说好砍 ${PVP.maxHits} 下就收手，留你一口气～`);
 
   const zh = {
     low_hp: `血被压到 ${hp}，乖乖认输了`,
     target_gone: `${nm} 跑没影了，收手`,
     timeout: `打满 ${Math.round((Date.now() - PVP.since) / 1000)}s 握手言和`,
     stopped: '被叫停了',
+    hit_cap: `砍满 ${PVP.maxHits} 刀按约定收手`,
     disconnect: '掉线了',
   }[why] || why;
   const minD = Number.isFinite(PVP.minDist) ? PVP.minDist : d0;
@@ -4553,7 +4558,7 @@ actRegister('pvp', async (a) => {
   return {
     ok: true,
     msg: `[L${skill} ${cfg.name}] 跟 ${nm} 比划了 ${hits} 下${whiffs ? `（手滑 ${whiffs} 次）` : ''}，${zh}（我血 ${Math.round(hp0)} → ${hp}）${closeNote}${fairNote}`,
-    extra: { why, nm, hits, whiffs, hp, hp0, skill, skillName: cfg.name, stopHp: PVP.stopHp, minDist: minD, fair },
+    extra: { why, nm, hits, whiffs, hp, hp0, skill, skillName: cfg.name, stopHp: PVP.stopHp, maxHits: PVP.maxHits, minDist: minD, fair },
   };
 });
 

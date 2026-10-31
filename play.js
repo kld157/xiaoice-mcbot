@@ -3827,7 +3827,7 @@ const AUTO_MENU_LIST = [
   ['collect', '在附近采集能当砖的方块，args: {count}'],
   ['pickup', '把附近的掉落物捡了'],
   ['eat', '吃点背包里的东西垫肚子'],
-  ['chest', '存/取/看箱子（清背包唯一有效的办法，toss 会被服务器回滚），args: {mode:"store|take|list", items:[...], preset:"junk"}'],
+  ['chest', '存/取/看箱子（清背包唯一有效的办法，toss 会被服务器回滚），args: {mode:"store|take|list", items:[...], preset:"junk", chest:"箱子名"}。给个新名字会自动新放一个箱子并记住坐标，比如 chest:"vault" 当保险箱'],
   ['armor', '换上背包里最好的护甲'],
   ['craft', '搓东西（木板/木棍/工作台/工具武器都行），args: {item:"英文id", count}；没工作台会自己搓一张摆上'],
   ['attack', '打附近的怪（自动换武器/追击/跳劈），args: {count 最多几只(默认2), secs 最多打几秒(默认15)}'],
@@ -4092,6 +4092,10 @@ const CONTAINER_NAMES = ['chest', 'trapped_chest', 'barrel'];
 const JUNK_PRESET = ['red_mushroom', 'rotten_flesh', 'phantom_membrane', 'leaf_litter', 'gunpowder',
   'bone', 'string', 'arrow', 'lead', 'copper_leggings', 'copper_helmet', 'copper_boots',
   'copper_chestplate', 'dark_oak_sapling', 'dirt'];
+const CHEST_FILE = path.join(__dirname, 'chests.json');
+function loadChests() { try { return JSON.parse(fs.readFileSync(CHEST_FILE, 'utf8')) || {}; } catch (e) { return {}; } }
+function saveChests(o) { try { fs.writeFileSync(CHEST_FILE, JSON.stringify(o, null, 2)); } catch (e) {} }
+function isContainerBlock(b) { return !!b && CONTAINER_NAMES.indexOf(b.name) >= 0; }
 function findChestBlock(r = 8) {
   try {
     const ids = CONTAINER_NAMES.map((n) => bot.registry.blocksByName[n] && bot.registry.blocksByName[n].id)
@@ -4128,7 +4132,17 @@ actRegister('chest', async (a) => {
   if ((a && a.preset) === 'junk' || (mode === 'store' && !names.length)) names = JUNK_PRESET.slice();
   names = names.map((n) => n.replace(/^minecraft:/, ''));
 
-  let block = findChestBlock(8);
+  const cname = String((a && a.chest) || '').toLowerCase();
+  const reg = loadChests();
+  let block = null;
+  if (cname && reg[cname]) {
+    const c = reg[cname];
+    const b = bot.blockAt(new Vec3(c[0], c[1], c[2]));
+    if (isContainerBlock(b)) block = b;      // 记住过就直接去那儿（不靠「最近的箱子」瞎猜）
+    else { delete reg[cname]; saveChests(reg); }
+  } else if (!cname) {
+    block = findChestBlock(8);
+  }
   let placedAt = null;
   if (!block && mode !== 'list') {
     const have = CONTAINER_NAMES.find((n) => invCountOf(n) > 0);
@@ -4142,6 +4156,7 @@ actRegister('chest', async (a) => {
     await sleep(300);
     block = bot.blockAt(spot);
     if (!block || block.boundingBox === 'empty') block = findChestBlock(8);
+    if (cname && isContainerBlock(block)) { reg[cname] = [spot.x, spot.y, spot.z]; saveChests(reg); }
   }
   if (!block) return { ok: false, msg: '附近没找到箱子（先用 store 放一个）', extra: { why: 'no_chest', placedAt } };
 
@@ -4156,7 +4171,7 @@ actRegister('chest', async (a) => {
     const describe = () => (cont.containerItems() || []).map((i) => `${i.name}x${i.count}`).join(',') || '空';
 
     if (mode === 'list') {
-      return { ok: true, msg: `箱子里有 ${usedSlots}/${chestSlots} 格：${describe()}`, extra: { placedAt, chestSlots, usedSlots, inside: inside.map((i) => ({ name: i.name, count: i.count })) } };
+      return { ok: true, msg: `箱子里有 ${usedSlots}/${chestSlots} 格：${describe()}`, extra: { placedAt, chestAt: [block.position.x, block.position.y, block.position.z], chestSlots, usedSlots, inside: inside.map((i) => ({ name: i.name, count: i.count })) } };
     }
 
     const moved = {};
@@ -4170,7 +4185,7 @@ actRegister('chest', async (a) => {
         }
         if (got) moved[nm] = got; else skipped.push(nm);
       }
-      return { ok: Object.keys(moved).length > 0, msg: `取出 ${Object.entries(moved).map(([k, v]) => k + 'x' + v).join(',') || '啥也没取到'}${skipped.length ? '（箱子里没有：' + skipped.join(',') + '）' : ''}`, extra: { moved, skipped, placedAt } };
+      return { ok: Object.keys(moved).length > 0, msg: `取出 ${Object.entries(moved).map(([k, v]) => k + 'x' + v).join(',') || '啥也没取到'}${skipped.length ? '（箱子里没有：' + skipped.join(',') + '）' : ''}`, extra: { moved, skipped, placedAt, chest: cname || null } };
     }
 
     // store：能塞多少塞多少，塞不下就报「箱子满了」
@@ -4193,7 +4208,7 @@ actRegister('chest', async (a) => {
         + (skipped.length ? `；没动：${skipped.join(',')}` : '')
         + (full ? '（箱子满了）' : '')
         + `；箱子 ${(cont.containerItems() || []).length}/${chestSlots} 格，背包占用 ${freed} 格`,
-      extra: { moved, skipped, placedAt, chestSlots, usedSlots: (cont.containerItems() || []).length, invUsed: freed },
+      extra: { moved, skipped, placedAt, chest: cname || null, chestSlots, usedSlots: (cont.containerItems() || []).length, invUsed: freed },
     };
   } catch (e) {
     return { ok: false, msg: '存取箱子出错：' + ((e && e.message) || e), extra: { placedAt } };

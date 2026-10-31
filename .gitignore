@@ -43,3 +43,4 @@ Thumbs.db
 
 # ==== 推送 token（绝对别上传）====
 .gh_token
+chests.json

@@ -40,3 +40,6 @@ __pycache__/
 # ==== 系统 ====
 .DS_Store
 Thumbs.db
+
+# ==== 推送 token（绝对别上传）====
+.gh_token

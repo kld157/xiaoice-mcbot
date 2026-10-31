@@ -106,6 +106,8 @@ ACT {"id":"1","name":"goto","args":{"x":100,"y":64,"z":200}}
 play.js              bot 主体（动作、自主行动、巡检、看门狗）
 mc_bridge.py         LLM 桥接（说话 / 决策 / token 记账 / 每日清理）
 craft_engine.js      通用合成规划器 + 测试 test_craft_engine.js
+gh_push.py           走 GitHub API 推送（网络差时替代 git push）
+_push_retry.sh       带重试推送：先 API，失败回退 git push
 start.sh             安全启动/重启（只认 node 跑的那个 play.js）
 watchdog.sh          单实例守护，异常退出自动拉起
 install_mineflayer.sh 一键环境安装（幂等）
@@ -130,6 +132,28 @@ mc_usage/            token 账本（按天，运行时生成）
 - **别用旧版本的 state 基线**：1.21.11 原版是 1166 种方块 / 29671 个 state（0..29670），
   拿别的版本数字（比如 1.20.6 的 26683）当基线会得出完全相反的结论。
 - **内存**：连续跑两天会把 heap 吃到 OOM。`start.sh` 里锁了 `--max-old-space-size=1024`，配合 `play.js` 的看门狗才稳。
+
+## 推送到 GitHub
+
+这台机器连 `github.com` 的 git 智能协议很容易超时/被掐断（`git fetch` 都能卡十几分钟），
+但 `api.github.com` 是通的。所以推送**优先走 API**：
+
+```bash
+python3 gh_push.py            # 直接推当前分支（Git Data API）
+python3 gh_push.py --dry-run  # 只看要推哪些 commit，不发请求
+./_push_retry.sh 3 30         # 带重试：先 API，失败才回退 git push
+```
+
+- `gh_push.py` 用 Git Data API 把 blob / tree / commit 逐层灌到远端。git 对象哈希由内容决定，
+  **重建出来的 commit SHA 和本地完全一致**，所以不会产生“远端历史被改写”的假象。
+  （坑：commit message 末尾的换行必须原样传，`rstrip` 一下哈希就变了。）
+- 回退的 `git push` 是**普通推送**，不再用 `--force`：真连上了就老老实实推；
+  万一本地和远端分叉，宁可失败也别悄悄覆盖。
+- token 放**本目录 `.gh_token`**（`chmod 600`，已在 `.gitignore` 里），或环境变量 `GH_TOKEN` / `GITHUB_TOKEN`。
+  细粒度 PAT 只需要 `Contents: Read and write` 权限。
+
+> 历史曾经做过脱敏重写。如果哪天确实需要强制覆盖远端（比如远端还留着旧提交），
+> 手动执行 `git push --force origin HEAD:main`，别把它写回脚本里。
 
 ## License
 

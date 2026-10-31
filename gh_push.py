@@ -214,11 +214,25 @@ def main():
         return 1
 
     head = git("rev-parse", "HEAD").strip()
-    ahead = [x for x in git("log", "--format=%h %s", f"origin/{BRANCH}..HEAD").splitlines() if x.strip()]
+
+    # 本地 origin/xxx 可能因为 fetch 不通而长期过期，所以直接用 API 问远端真实位置
+    remote = api("GET", f"/repos/{OWNER}/{REPO}/git/ref/heads/{BRANCH}", ok404=True)
+    remote_sha = remote["object"]["sha"] if remote else ""
+    base = ""
+    if remote_sha:
+        exists = subprocess.run(["git", "cat-file", "-e", remote_sha + "^{commit}"],
+                                cwd=HERE, capture_output=True).returncode == 0
+        base = remote_sha if exists else ""
+    rng = f"{base}..HEAD" if base else "HEAD"
+    ahead = [x for x in git("log", "--format=%h %s", rng).splitlines() if x.strip()]
     print(f"repo   : {OWNER}/{REPO}  branch: {BRANCH}")
-    print(f"head   : {head[:10]}  待推 {len(ahead)} 个 commit")
-    for line in ahead:
-        print("  -", line)
+    print(f"remote : {remote_sha[:10] or '(空)'}  head: {head[:10]}")
+    if base:
+        print(f"待推   : {len(ahead)} 个 commit")
+        for line in ahead:
+            print("  -", line)
+    else:
+        print("待推   : 远端历史与本地对不上（或为空），将重建整条链")
 
     if args.dry_run:
         print("dry-run：不发送任何请求")

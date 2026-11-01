@@ -49,3 +49,9 @@ pvp_watch.log
 # ==== 本地推送工具（与项目无关，不进仓库）====
 gh_push.py
 _push_retry.sh
+
+# ==== 本地草稿文档（含本机 workspace 路径，留在工作区，不进仓库）====
+_scratch/
+mcbot_docs/
+cortico create.md
+cortico create.md.bak-*

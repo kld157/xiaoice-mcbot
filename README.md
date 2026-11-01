@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/banner.png" alt="小冰 Minecraft Bot —— 能聊天、能干活、能自己找事做的 Minecraft 常驻机器人" width="100%">
+<img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/banner.jpg" alt="小冰 Minecraft Bot —— 能聊天、能干活、能自己找事做的 Minecraft 常驻机器人" width="100%">
 
 # 小冰 Minecraft Bot
 

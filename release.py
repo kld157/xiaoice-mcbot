@@ -8,6 +8,13 @@
   python3 release.py -t v0.4.0 --from v0.3.0   # 指定起点（默认自动取最近一个 tag）
   python3 release.py -t v0.4.0 --note-extra notes.md   # 追加一段自定义说明
 
+改写已发布的文案（不新建 tag，只 PATCH 已有 release）:
+  python3 release.py -t v0.4.0 --update --body-file body.md --name "标题"
+  python3 release.py -t v0.4.0 --update --body-file body.md --dry-run
+
+注意：GitHub 不支持按 tag PATCH（会 404），所以 --update 先 GET releases/tags/<tag>
+拿到 release id，再 PATCH releases/<id>。
+
 提交信息前缀映射（大小写不敏感，可带 scope，如 `feat(chest): ...`）:
   feat / add / 新增        -> 新功能
   fix / bug / 修复         -> 修复
@@ -137,12 +144,44 @@ def main():
     ap.add_argument("--from", dest="since", default="", help="起点 tag，默认最近一个")
     ap.add_argument("--target", default="main", help="目标分支，默认 main")
     ap.add_argument("--note-extra", default="", help="追加一段文件内容")
+    ap.add_argument("--body-file", default="", help="用这个文件当 release 正文（--update 时用）")
+    ap.add_argument("--update", action="store_true",
+                    help="只改已发布 release 的标题/正文，不新建 tag")
     ap.add_argument("--draft", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    since = a.since or latest_tag()
     repo = repo_slug()
+
+    # ---- 只改文案模式：不建 tag，直接 PATCH 已有 release ----
+    if a.update:
+        payload = {}
+        txt = ""
+        if a.body_file:
+            txt = open(a.body_file, encoding="utf-8").read()
+            payload["body"] = txt
+        if a.name:
+            payload["name"] = a.name
+        if not payload:
+            sys.exit("--update 需要配合 --body-file 或 --name")
+        if a.dry_run:
+            print(f"repo   : {repo}")
+            print(f"tag    : {a.tag}（更新已有 release，不建 tag）")
+            if a.name:
+                print(f"title  : {a.name}")
+            print("-" * 60)
+            print(txt or "(正文不变)")
+            return
+        tok = token()
+        if not tok:
+            sys.exit("没有 token：设置 GH_TOKEN / GITHUB_TOKEN，或写入 .gh_token")
+        # 先按 tag 查 id：PATCH /releases/tags/<tag> 会 404，必须打到 /releases/<id>
+        rel = api("GET", f"/repos/{repo}/releases/tags/{a.tag}", tok=tok)
+        out = api("PATCH", f"/repos/{repo}/releases/{rel['id']}", payload, tok=tok)
+        print("OK", out.get("html_url", out))
+        return
+
+    since = a.since or latest_tag()
     commits = collect(since)
     extra = open(a.note_extra, encoding="utf-8").read() if a.note_extra else ""
     body = build_body(commits, since, repo, extra)

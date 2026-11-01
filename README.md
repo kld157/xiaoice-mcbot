@@ -43,7 +43,7 @@
 5. 🔍 **可观测性**：结构化日志（位置、血量、伤害来源、挖放失败原因），并提供 `flags` / `drops` / `inventory` 等只读诊断动作。
 6. 🗺️ **方块扫描**：`scan` 动作与 `mcscan.py` 封装统一处理「找箱子、找矿、找结构」，只读、不改动世界。
 7. 💰 **成本可控**：每次模型调用的用量按天记账（`mc_usage/YYYY-MM-DD.jsonl`），可配置保留天数自动清理；
-   配合 AstrBot 的「余额」插件 `astrbot_plugin_token_meter` 即可查看每日花费、可撑天数与可聊轮数。
+   配合 AstrBot 的「余额」插件 `astrbot_plugin_token_meter`（**未公开**，见下节说明）即可查看每日花费、可撑天数与可聊轮数。
 
 ## 快速开始
 
@@ -110,9 +110,13 @@ python3 mc_bridge.py   # 另一个进程，负责对话与决策
 
 ### 5. 看花费（可选）：需要装「余额」插件
 
+> ⚠️ **说明：`astrbot_plugin_token_meter`（「余额预测（token 计费）」插件）未公开**，
+> 没有仓库地址、不在插件市场、也不对外分发，所以不要去找它。
+> 下面对它的描述只是说明「这份账本是给谁用的」，不影响本项目单独运行。
+
 账本 `mc_usage/YYYY-MM-DD.jsonl` 本身只是个文件，不会自己显示任何内容。想看「今天花了多少 / 余额还能撑几天」，
-需要在 AstrBot 里安装 **「余额预测（token 计费）」插件 —— `astrbot_plugin_token_meter`**
-（它的 `mc_source.py` 就是专门读这份 MC 账本的），再把它配置里的 `mc_usage_path` 指向本目录的 `mc_usage`
+本机是把它接进 AstrBot 的 **「余额预测（token 计费）」插件 —— `astrbot_plugin_token_meter`**
+（它的 `mc_source.py` 就是专门读这份 MC 账本的），再把插件配置里的 `mc_usage_path` 指向本目录的 `mc_usage`
 （填 `mcbot` 目录或 `mc_usage` 目录都可以）。
 
 装好后直接在聊天里用：
@@ -123,7 +127,8 @@ python3 mc_bridge.py   # 另一个进程，负责对话与决策
 /余额 7天      # 近 7 天每日消耗
 ```
 
-> 不装这个插件，bot 照样正常跑，只是没有账单界面；账本依然按天写入，超过 `MC_USAGE_KEEP_DAYS` 会自动清理。
+> 不装这个插件，bot 照样正常跑，只是没有账单界面。账本依然按天写入，超过 `MC_USAGE_KEEP_DAYS` 会自动清理；
+> 想自己看数的话，它只是一行一个 JSON（含模型名、输入/输出 token、时间），随手 `jq`/几行 Python 就能按天汇总。
 
 ## 使用方式
 

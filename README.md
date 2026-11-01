@@ -199,40 +199,6 @@ skins/                皮肤生成与渲染脚本
 mc_usage/             用量账本（按天生成，运行时产物）
 ```
 
-## 运维
-
-### 用量记账
-
-每次模型调用的 usage 追加写入 `mc_usage/YYYY-MM-DD.jsonl`（每行一次，本地时区）。
-账本按天自动清理，默认保留 90 天（`MC_USAGE_KEEP_DAYS` 可调）；
-`mc_usage.jsonl.migrated-*` 为旧版单文件账本留档，遵循同一保留策略。
-
-### 发布版本
-
-```bash
-python3 release.py -t v0.4.0 --dry-run   # 预览发布说明，不发请求
-python3 release.py -t v0.4.0             # 打 tag 并创建 Release
-```
-
-发布说明按提交前缀（`feat:` / `fix:` / `docs:` / `chore:` …）自动分组，起点默认为最近一个 tag，
-可用 `--from` 指定；`.github/release.yml` 为 GitHub 原生发布说明功能的分组配置。
-
-### 推送到 GitHub
-
-本机连接 `github.com` 的 Git 协议经常超时，而 `api.github.com` 可用，因此推送优先走 API：
-
-```bash
-python3 gh_push.py            # 推送当前分支（Git Data API）
-python3 gh_push.py --dry-run  # 仅列出待推送的 commit
-./_push_retry.sh 3 30         # 带重试：先 API，失败回退 git push
-```
-
-`gh_push.py` 通过 Git Data API 逐层提交 blob / tree / commit。Git 对象哈希由内容决定，
-重建的 commit SHA 与本地一致，不会改写远端历史。回退的 `git push` 为普通推送，不使用 `--force`。
-
-Token 存放于本目录 `.gh_token`（`chmod 600`，已在 `.gitignore` 中），或使用环境变量 `GH_TOKEN` / `GITHUB_TOKEN`；
-细粒度 PAT 仅需 `Contents: Read and write` 权限。
-
 ## FAQ
 
 **Q：能放置、也能挖掘，但服务器一律拒绝？**

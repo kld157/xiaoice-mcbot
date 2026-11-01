@@ -279,6 +279,7 @@ mc_usage/             用量账本（按天生成，运行时产物；供 AstrBo
 - **[mineflayer](https://github.com/PrismarineJS/mineflayer)** 与 **[PrismarineJS](https://github.com/PrismarineJS)**：整个项目的连接、物理与寻路都建立在它们之上。
 - **[minecraft-data](https://github.com/PrismarineJS/minecraft-data)**：方块、配方与协议数据的来源。
 - **[AstrBot](https://github.com/AstrBotDevs/AstrBot)**：小冰在聊天软件里的那一半，本来就是从这里来的。
+  > 注：AstrBot 只是**聊天侧接入的插件依赖**（让小冰在 QQ / 频道里说话）；**MC 机器人本体不依赖 AstrBot**，不装它也能直接 `./start.sh` 独立运行。
 - **[MaiBot](https://github.com/Mai-with-u/MaiBot)**：本 README 的章节组织与「最像而不是好」的思路参考了它。
 
 ## 注意事项

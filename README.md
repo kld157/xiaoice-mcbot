@@ -6,7 +6,7 @@
 
 **一个常驻服务器的 Minecraft 陪玩机器人 —— 能聊天、能干活、也会自己找事做。**
 
-<sub>当前发布版本 **v0.3.0** · 适配 Minecraft 1.21.11</sub>
+<sub>当前发布版本 **v0.3.1** · 适配 Minecraft 1.21.11</sub>
 
 [![Release](https://img.shields.io/github/v/release/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/astrbot-xiaoice-mcbot/releases)
 [![Stars](https://img.shields.io/github/stars/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b&logo=github)](https://github.com/kld157/astrbot-xiaoice-mcbot/stargazers)

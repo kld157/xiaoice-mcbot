@@ -1184,6 +1184,108 @@ async function runAction(line) {
 
 actRegister('perceive', () => perceive());
 
+// 诊断用：把附近所有水点的落差/岸边情况列出来（钓不到鱼时排障）
+actRegister('pathdiag', async (a) => {
+  if (!bot || !bot.entity) return { ok: false, msg: '还没进服' };
+  const p0 = bot.entity.position;
+  const W = findFishWater(96);
+  if (!W) return { ok: false, msg: '96 格内没露天水' };
+  const out = [];
+  const steps = 26;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const x = Math.round(p0.x + (W.x - p0.x) * t);
+    const z = Math.round(p0.z + (W.z - p0.z) * t);
+    // 从水面往上一路上看，找最高的实体块
+    let top = null, topY = null;
+    for (let y = W.y + 16; y >= W.y - 2; y--) {
+      const b = bot.blockAt(new Vec3(x, y, z));
+      if (b && b.boundingBox === 'block') { top = b.name; topY = y; break; }
+    }
+    out.push(`${i}:(${x},${z}) top=${topY}${top ? ' ' + top : ''}`);
+  }
+  const s = out.join(' | ');
+  log('PATHDIAG ' + s);
+  return { ok: true, msg: `水 ${[W.x, W.y, W.z].join(',')} 剖面 ${out.length} 段`, extra: { water: [W.x, W.y, W.z], profile: out } };
+});
+
+actRegister('phys', async () => {
+  const e = bot.entity || {};
+  const p0 = e.position.clone();
+  const info = {
+    version: bot.version,
+    physEnabled: bot.physicsEnabled,
+    physics: !!bot.physics,
+    onGround: e.onGround,
+    vy: e.velocity ? +e.velocity.y.toFixed(3) : null,
+    yaw: +e.yaw.toFixed(2),
+    pos: [+p0.x.toFixed(1), +p0.y.toFixed(1), +p0.z.toFixed(1)],
+    controls: JSON.stringify(bot.controlState || {}),
+  };
+  // 真走两步看看动不动
+  try {
+    bot.pathfinder.setGoal(null);
+    bot.setControlState('forward', true);
+    await sleep(1200);
+    bot.setControlState('forward', false);
+  } catch (err) {}
+  const p1 = bot.entity.position;
+  info.moved = +p0.distanceTo(p1).toFixed(2);
+  log('PHYS ' + JSON.stringify(info));
+  return { ok: true, msg: `走动 ${info.moved} 格 (phys=${info.physEnabled})`, extra: info };
+});
+
+actRegister('around', (a) => {
+  const r = Math.max(1, Math.min(4, parseInt((a && a.r) || 2, 10) || 2));
+  const p = bot.entity.position;
+  const cx = Math.floor(p.x), cy = Math.floor(p.y), cz = Math.floor(p.z);
+  const rows = [];
+  for (let y = cy - 2; y <= cy + 5; y++) {
+    const line = [];
+    for (let x = cx - r; x <= cx + r; x++) {
+      for (let z = cz - r; z <= cz + r; z++) {
+        const b = bot.blockAt(new Vec3(x, y, z));
+        if (b && b.boundingBox === 'block') line.push(`${x - cx},${z - cz}=${b.name.slice(0, 6)}`);
+      }
+    }
+    rows.push('y' + (y - cy) + ': ' + (line.length ? line.join(' ') : '空'));
+  }
+  return { ok: true, msg: `四周剖面 中心(${cx},${cy},${cz})`, extra: { rows } };
+});
+
+actRegister('fishdiag', async () => {
+  if (!bot || !bot.entity) return { ok: false, msg: '还没进服' };
+  const p0 = bot.entity.position;
+  const cand = bot.findBlocks({ matching: (b) => b && b.name === 'water', maxDistance: 64, count: 3000 });
+  const rows = cand.map((p) => {
+    const b = bot.blockAt(p);
+    const above = bot.blockAt(p.offset(0, 1, 0));
+    let shore = 0;
+    for (const d of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const g = bot.blockAt(p.offset(d[0], 0, d[1]));
+      if (g && g.boundingBox === 'block' && g.name !== 'water') shore++;
+    }
+    return {
+      pos: `${p.x},${p.y},${p.z}`,
+      d: +p0.distanceTo(p).toFixed(1),
+      dy: +(p.y - p0.y).toFixed(0),
+      top: above ? above.name : '?',
+      shore,
+      fluid: b ? b.name : '?',
+    };
+  }).sort((a, b) => a.d - b.d);
+  const out = rows.slice(0, 12);
+  const surface = rows.filter((r) => r.top === 'air' || r.top === 'cave_air');
+  log('FISHDIAG ' + JSON.stringify({
+    pos: `${p0.x.toFixed(1)},${p0.y.toFixed(1)},${p0.z.toFixed(1)}`,
+    total: rows.length,
+    surfaceCnt: surface.length,
+    surfaceTop5: surface.slice(0, 5),
+    top: out,
+  }));
+  return { ok: true, msg: `水点 ${rows.length} 个，其中露天 ${surface.length} 个（明细见日志）` };
+});
+
 actRegister('diag', async () => {
   const out = { gm: bot.game.gameMode, dim: bot.game.dimension, hardcore: bot.game.hardcore };
   const me = bot.entity.position.floored();
@@ -3567,6 +3669,111 @@ async function walkStraightTo(target, maxMs = 20000, stopDist = 2.2) {
   return bot.entity.position.distanceTo(target);
 }
 
+
+// 只算水平距离：这服的水塘常常在脚下十几格（深坑/峡谷），
+// 用 3D 距离永远"差 18 格"，然后就永远觉得没走到
+function hDist(a, b) { return Math.hypot(a.x - b.x, a.z - b.z); }
+
+// 优先用 pathfinder 绕过障碍（这服偶尔 "Took too long to decide path"，所以带超时+兜底）
+async function walkToNear(target, maxMs = 15000, near = 2) {
+  try { bot.pathfinder.setGoal(null); } catch (e) {}
+  try {
+    bot.pathfinder.thinkTimeout = 25000;      // 默认 5s，这服算不动，直接判死
+    bot.pathfinder.tickTimeout = 120;
+    bot.pathfinder.enablePathfindDebug = false;
+  } catch (e) {}
+  const mv = new Movements(bot);
+  mv.canDig = false;
+  mv.allowSprinting = false;
+  mv.allowParkour = true;
+  bot.pathfinder.setMovements(mv);
+  try {
+    await Promise.race([
+      bot.pathfinder.goto(new goals.GoalNear(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z), near)),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('pathfinder 超时')), maxMs)),
+    ]);
+  } catch (e) {
+    log('FISH> pathfinder 没走通: ' + String((e && e.message) || e).slice(0, 50));
+  } finally {
+    try { bot.pathfinder.setGoal(null); } catch (e) {}
+  }
+  // pathfinder 算不出来就自己走过去：一直抬头朝目标、按住前进 + 不停蹦
+  // （这服的 A* 基本废了，但"蹦着走"能翻 1 格台阶，人被卡住也就这样自救）
+  if (hDist(bot.entity.position, target) > near + 0.8) {
+    try { await bunnyWalk(target, Math.min(20000, Math.max(5000, maxMs)), near); } catch (e) {}
+  }
+  return hDist(bot.entity.position, target);
+}
+
+async function bunnyWalk(target, maxMs = 15000, near = 2) {
+  const t0 = Date.now();
+  try { bot.pathfinder.setGoal(null); } catch (e) {}
+  let best = hDist(bot.entity.position, target);
+  let bestAt = Date.now();
+  const off = () => {
+    for (const k of ['forward', 'back', 'left', 'right', 'jump', 'sprint']) {
+      try { bot.setControlState(k, false); } catch (e) {}
+    }
+  };
+  try {
+    while (Date.now() - t0 < maxMs) {
+      const p = bot.entity.position;
+      const d = hDist(p, target);
+      if (d <= near) break;
+      // 抬头看向目标（只取水平朝向，眼睛高度对齐）
+      try { await bot.lookAt(new Vec3(target.x, p.y + 1.6, target.z), true); } catch (e) {}
+      bot.setControlState('forward', true);
+      bot.setControlState('jump', true);      // 按住跳：遇台阶自动蹦上去
+      await sleep(150);
+      bot.setControlState('jump', false);
+      // 卡住检测：2.5 秒没更近，就左右蹭一下绕开
+      if (d < best - 0.3) { best = d; bestAt = Date.now(); }
+      else if (Date.now() - bestAt > 2500) {
+        const side = Math.random() < 0.5 ? 'left' : 'right';
+        bot.setControlState(side, true);
+        await sleep(450);
+        bot.setControlState(side, false);
+        bestAt = Date.now();
+      }
+      await sleep(60);
+    }
+  } finally {
+    off();
+  }
+  return hDist(bot.entity.position, target);
+}
+
+// 找一块"真能钓"的水：必须是真的露天地表水（上方是空气），旁边有岸
+// —— 地下暗河（上方是石头）永远走不到，之前就是这么被坑的
+function findFishWater(maxDist) {
+  const cand = bot.findBlocks({ matching: (b) => b && b.name === 'water', maxDistance: maxDist, count: 300 });
+  let best = null, bestScore = Infinity;
+  for (const p of cand) {
+    const b = bot.blockAt(p);
+    if (!b || b.name !== 'water') continue;
+    const above = bot.blockAt(p.offset(0, 1, 0));
+    if (!above || !/^(air|cave_air)$/.test(above.name)) continue;   // 只认露天水面
+    // 关键：头顶要一路通透到天上，否则是"封在地下洞穴里的水"，走过去也够不着
+    let sealed = false;
+    for (let dy = 2; dy <= 12; dy++) {
+      const q = bot.blockAt(p.offset(0, dy, 0));
+      if (!q || q.boundingBox === 'block') { sealed = true; break; }
+    }
+    if (sealed) continue;
+    let shore = false;
+    for (const d of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const g = bot.blockAt(p.offset(d[0], 0, d[1]));
+      if (g && g.boundingBox === 'block' && g.name !== 'water') shore = true;
+    }
+    if (!shore) continue;
+    const dist = hDist(bot.entity.position, p);
+    const dy = Math.abs(p.y - bot.entity.position.y);
+    const score = dist + dy * 1.5;
+    if (score < bestScore) { bestScore = score; best = p; }
+  }
+  return best;
+}
+
 async function actWander() {
   const f = bot.entity.position, ang = Math.random() * Math.PI * 2, d = 4 + Math.random() * 4;
   const tx = Math.floor(f.x + Math.cos(ang) * d), tz = Math.floor(f.z + Math.sin(ang) * d);
@@ -4170,31 +4377,45 @@ actRegister('fish', async (a) => {
   if (!(a && a.force) && tod > 12900 && tod < 23100) {
     return { ok: false, msg: '天黑了（time=' + tod + '），等天亮再钓，不然要被僵尸咬' };
   }
-  let W = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 12 })
-    || bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 64 });
-  if (!W) return { ok: false, msg: '附近 64 格内没找到水，钓不了' };
+  let W = findFishWater(16) || findFishWater(64) || findFishWater(96);
+  if (!W) {
+    return { ok: false, msg: '附近 96 格内没有露天水（只有被石头盖住的地下暗河），钓不了；要么换个地方，要么吃别的' };
+  }
+  // findFishWater 返回的是坐标点，findBlock 返回的是方块——统一取坐标，别踩 .position 的坑
+  const posOf = (w) => (w && w.position) ? w.position : w;
+  let wPos = posOf(W);
   // 找到了但离得远，先走过去（站到水里 3 格内的岸上）
-  const dW = bot.entity.position.distanceTo(W.position);
+  const dW = hDist(bot.entity.position, wPos);
   if (dW > 3.2) {
-    // 直接朝水走（这服 pathfinder 会 "Took to long to decide path"），一步步靠近
+    log('FISH> 目标水 ' + [wPos.x, wPos.y, wPos.z].join(',') + ' 水平距离 ' + dW.toFixed(1));
+    const tApproach = Date.now();
     let tries = 0;
-    while (tries++ < 3 && bot.entity.position.distanceTo(W.position) > 3.2) {
-      const Wc = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 40 }) || W;
-      W = Wc;
-      const left = await walkStraightTo(W.position, 12000, 2.4);
-      log('FISH> 靠近水 剩 ' + left.toFixed(1) + ' 格');
-      if (left <= 3.2) break;
+    // 80 秒预算内一直磨：先寻路（能绕障），再直冲，交替着来，不轻易认输
+    while (Date.now() - tApproach < 80000 && hDist(bot.entity.position, wPos) > 2.5) {
+      tries++;
+      const nb = findFishWater(48);
+      if (nb) wPos = posOf(nb);
+      let left = await walkToNear(wPos, 12000, 2);            // 先正经寻路（能绕障）
+      log('FISH> 第' + tries + '轮寻路 剩 ' + left.toFixed(1) + ' 格');
+      if (left <= 2.5) break;
+      left = await walkStraightTo(wPos, 8000, 2.4);           // 再直冲补距离
+      log('FISH> 第' + tries + '轮直冲 剩 ' + left.toFixed(1) + ' 格');
+      if (left <= 2.5) break;
     }
-    const W2 = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 5 });
-    if (W2) W = W2;
-    const dNow = bot.entity.position.distanceTo(W.position);
-    if (dNow > 6.5) {
-      return { ok: false, msg: '看到水了，但走不过去（还差 ' + dNow.toFixed(1) + ' 格）' };
+    // 站到最近的岸边水块再下竿（抛竿要求视线里就是水）
+    const near = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 6 });
+    if (near) wPos = near.position;
+    const dNow = hDist(bot.entity.position, wPos);
+    const dyNow = bot.entity.position.y - wPos.y;
+    log('FISH> 到位检查 水平 ' + dNow.toFixed(1) + ' 高度差 ' + dyNow.toFixed(1));
+    if (dNow > 5) {
+      return { ok: false, msg: '看到水了，但走不过去（水平还差 ' + dNow.toFixed(1) + ' 格）' };
     }
-    await bot.lookAt(W.position.offset(0.5, 0.5, 0.5), true).catch(() => {});
   }
   await bot.equip(rod, 'hand').catch(() => {});
-  await bot.lookAt(W.position.offset(0.5, 0.5, 0.5), true).catch(() => {});
+  await bot.lookAt(wPos.offset(0.5, 0.35, 0.5), true).catch(() => {});
+  const fishSum = () => bot.inventory.items().filter((i) => /^(cod|salmon|tropical_fish|pufferfish)$/.test(i.name)).reduce((a, i) => a + i.count, 0);
+  const fishStart = fishSum();
   let got = [];
   let errs = [];
   for (let i = 0; i < casts; i++) {
@@ -4207,7 +4428,7 @@ actRegister('fish', async (a) => {
     } catch (e) {
       errs.push(String((e && e.message) || e).slice(0, 40));
       await new Promise((r) => setTimeout(r, 800));
-      await bot.lookAt(W.position.offset(0.5, 0.5, 0.5), true).catch(() => {});
+      await bot.lookAt(wPos.offset(0.5, 0.35, 0.5), true).catch(() => {});
       continue;
     }
     const after = invCountOf('cod') + invCountOf('salmon') + invCountOf('tropical_fish') + invCountOf('pufferfish');
@@ -4218,14 +4439,17 @@ actRegister('fish', async (a) => {
     }
     await new Promise((r) => setTimeout(r, 600));
   }
-  const total = got.reduce((x, y) => x + y, 0);
+  const fishEnd = fishSum();
+  // 别信逐竿差值了：发包有延迟，逐竿算出来老是 0。直接看开局和收竿时的总条数
+  const total = Math.max(fishEnd - fishStart, got.reduce((x, y) => x + y, 0));
+  log('FISH> 收竿统计 开局 ' + fishStart + ' 条 → 现在 ' + fishEnd + ' 条');
   const kinds = bot.inventory.items().filter((i) => /^(cod|salmon|tropical_fish|pufferfish)$/.test(i.name)).map((i) => i.name + 'x' + i.count);
   return {
     ok: total > 0,
     msg: total > 0
       ? `钓上来 ${total} 条鱼（${kinds.join('、')}）`
       : `抛了 ${casts} 竿一条没上来：${errs.slice(0, 2).join(' / ') || '没鱼咬钩'}`,
-    extra: { total, kinds, casts, errs: errs.slice(0, 4), water: [Math.round(W.position.x), Math.round(W.position.y), Math.round(W.position.z)] },
+    extra: { total, kinds, casts, errs: errs.slice(0, 4), water: [Math.round(wPos.x), Math.round(wPos.y), Math.round(wPos.z)] },
   };
 });
 

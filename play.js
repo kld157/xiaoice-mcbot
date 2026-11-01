@@ -4259,7 +4259,7 @@ actRegister('weapons', async () => {
 // 有人手动下指令时自动让路（暂停 20 分钟），不抢活。
 const AUTO = {
   on: String(process.env.MC_AUTO || '1') !== '0',
-  everyMs: Math.max(60000, +(process.env.MC_AUTO_MS || 600000)),
+  everyMs: Math.max(60000, +(process.env.MC_AUTO_MS || 300000)),   // 默认 5 分钟，与 start.sh / watchdog.sh 保持一致
   lastAt: Date.now() - 540000,  // 上次决策时间（启动后约 1 分钟先自己找点事做）
   running: false,          // 决策/执行中
   pauseUntil: 0,           // 手动指令后的让路截止

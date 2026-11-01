@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/banner.png" alt="小冰 Minecraft Bot —— 能聊天、能干活、能自己找事做的 Minecraft 常驻机器人" width="100%">
+
 # 小冰 Minecraft Bot
 
 **一个常驻服务器的 Minecraft 陪玩机器人 —— 能聊天、能干活、也会自己找事做。**
@@ -7,6 +9,8 @@
 <sub>当前发布版本 **v0.3.0** · 适配 Minecraft 1.21.11</sub>
 
 [![Release](https://img.shields.io/github/v/release/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/astrbot-xiaoice-mcbot/releases)
+[![Stars](https://img.shields.io/github/stars/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b&logo=github)](https://github.com/kld157/astrbot-xiaoice-mcbot/stargazers)
+[![Last Commit](https://img.shields.io/github/last-commit/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/astrbot-xiaoice-mcbot/commits)
 [![Node](https://img.shields.io/badge/node-18%2B-339933?style=flat-square&labelColor=46423b&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Minecraft](https://img.shields.io/badge/minecraft-1.21.11-62b47a?style=flat-square&labelColor=46423b)](https://www.minecraft.net/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square&labelColor=46423b)](LICENSE)
@@ -33,6 +37,19 @@
 - **不写指令也能用**：玩家在游戏里正常说话，模型自己挑该调用的动作，不用背 `/` 命令表。
 - **没人理它的时候也在场**：默认每 5 分钟自己做一次决策（`MC_AUTO_MS=300000`），会走路、整理、查看四周，而不是站着假装在线。
 - **会失手，但说得清楚**：挖不动、放不下、材料不够、箱子没登记，都会用一句人话告诉你原因，而不是沉默或假装完成。
+
+## 效果展示
+
+<!-- 截图位（把图放进 assets/ 后取消注释即可显示）
+<img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/demo-chat.png" width="49%"> <img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/demo-mining.png" width="49%">
+
+<img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/demo-build.png" width="100%">
+
+- 🗣️ **左**：有人在游戏里随口一句「你手上有啥」，它先报背包再问要不要帮忙
+- ⛏️ **右**：没人指挥时自己下洞挖矿，遇到苦力怕会先撤
+- 🏠 **下**：说一句「搭个小屋」就按位置和材料自己开工
+-->
+_截图陆续补充中。_
 
 ## 主要功能
 

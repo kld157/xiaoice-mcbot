@@ -70,12 +70,12 @@ while true; do
 
   if ! is_bot; then
     echo "[$(date -u +%FT%TZ)] watchdog: bot not running -> start" >> watchdog.log
-    setsid nohup node --expose-gc play.js >/dev/null 2>&1 &
+    nohup node --expose-gc play.js >/dev/null 2>&1 &
     sleep 15
   fi
   if ! is_bridge; then
     echo "[$(date -u +%FT%TZ)] watchdog: bridge not running -> start" >> watchdog.log
-    setsid nohup python3 mc_bridge.py >/dev/null 2>&1 < /dev/null &
+    nohup python3 mc_bridge.py >/dev/null 2>&1 < /dev/null &
     sleep 5
   fi
   sleep 20

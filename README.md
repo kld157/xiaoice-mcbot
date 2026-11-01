@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/banner.jpg" alt="小冰 Minecraft Bot —— 能聊天、能干活、能自己找事做的 Minecraft 常驻机器人" width="100%">
+<img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/banner.jpg" alt="小冰 Minecraft Bot —— 能聊天、能干活、能自己找事做的 Minecraft 常驻机器人" width="100%">
 
 # 小冰 Minecraft Bot
 
@@ -8,9 +8,9 @@
 
 <sub>适配 Minecraft 1.21.11</sub>
 
-[![Release](https://img.shields.io/github/v/release/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/astrbot-xiaoice-mcbot/releases)
-[![Stars](https://img.shields.io/github/stars/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b&logo=github)](https://github.com/kld157/astrbot-xiaoice-mcbot/stargazers)
-[![Last Commit](https://img.shields.io/github/last-commit/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/astrbot-xiaoice-mcbot/commits)
+[![Release](https://img.shields.io/github/v/release/kld157/xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/xiaoice-mcbot/releases)
+[![Stars](https://img.shields.io/github/stars/kld157/xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b&logo=github)](https://github.com/kld157/xiaoice-mcbot/stargazers)
+[![Last Commit](https://img.shields.io/github/last-commit/kld157/xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/xiaoice-mcbot/commits)
 [![Node](https://img.shields.io/badge/node-18%2B-339933?style=flat-square&labelColor=46423b&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Minecraft](https://img.shields.io/badge/minecraft-1.21.11-62b47a?style=flat-square&labelColor=46423b)](https://www.minecraft.net/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square&labelColor=46423b)](LICENSE)
@@ -41,9 +41,9 @@
 ## 效果展示
 
 <!-- 截图位（把图放进 assets/ 后取消注释即可显示）
-<img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/demo-chat.png" width="49%"> <img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/demo-mining.png" width="49%">
+<img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/demo-chat.png" width="49%"> <img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/demo-mining.png" width="49%">
 
-<img src="https://cdn.jsdmirror.com/gh/kld157/astrbot-xiaoice-mcbot@main/assets/demo-build.png" width="100%">
+<img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/demo-build.png" width="100%">
 
 - 🗣️ **左**：有人在游戏里随口一句「你手上有啥」，它先报背包再问要不要帮忙
 - ⛏️ **右**：没人指挥时自己下洞挖矿，遇到苦力怕会先撤

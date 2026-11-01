@@ -4,23 +4,35 @@
 
 **一个常驻服务器的 Minecraft 陪玩机器人 —— 能聊天、能干活、也会自己找事做。**
 
-[![Release](https://img.shields.io/github/v/release/kld157/astrbot-xiaoice-mcbot?color=76bad9)](https://github.com/kld157/astrbot-xiaoice-mcbot/releases)
-[![Node](https://img.shields.io/badge/node-18%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![Minecraft](https://img.shields.io/badge/minecraft-1.21.11-62b47a)](https://www.minecraft.net/)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+<sub>当前发布版本 **v0.3.0** · 适配 Minecraft 1.21.11</sub>
+
+[![Release](https://img.shields.io/github/v/release/kld157/astrbot-xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/astrbot-xiaoice-mcbot/releases)
+[![Node](https://img.shields.io/badge/node-18%2B-339933?style=flat-square&labelColor=46423b&logo=node.js&logoColor=white)](https://nodejs.org/)
+[![Minecraft](https://img.shields.io/badge/minecraft-1.21.11-62b47a?style=flat-square&labelColor=46423b)](https://www.minecraft.net/)
+[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square&labelColor=46423b)](LICENSE)
 
 <a href="#主要功能">主要功能</a> ｜
 <a href="#快速开始">快速开始</a> ｜
 <a href="#使用方式">使用方式</a> ｜
 <a href="#架构">架构</a> ｜
-<a href="#faq">常见问题</a>
+<a href="#常见问题">常见问题</a> ｜
+<a href="#特别致谢">致谢</a> ｜
+<a href="#注意事项">注意事项</a>
 
 </div>
+
+## 简介
 
 本项目基于 [mineflayer](https://github.com/PrismarineJS/mineflayer) 实现一个长期在线的 Minecraft 机器人，
 并以大语言模型作为决策层：它可以参与聊天、跟随玩家、采集与建造、战斗，也能在无人指挥时自主安排行动。
 
 它的定位不是「脚本刷资源工具」，而是尽可能让一个角色自然地在服务器里长期存在，与玩家一起游玩。
+
+- **不追求「更好」，追求「更像」**：项目组织与「最像而不是好」的设计取向参考了 [MaiBot](https://github.com/Mai-with-u/MaiBot)。
+  一个有用的助手会给出最优解，而一个同伴会先看看你人在哪、背包还够不够，再决定要不要帮忙。
+- **不写指令也能用**：玩家在游戏里正常说话，模型自己挑该调用的动作，不用背 `/` 命令表。
+- **没人理它的时候也在场**：默认每 10 分钟自己决定一次做什么，会走路、整理、查看四周，而不是站着假装在线。
+- **会失手，但说得清楚**：挖不动、放不下、材料不够、箱子没登记，都会用一句人话告诉你原因，而不是沉默或假装完成。
 
 ## 主要功能
 
@@ -242,7 +254,25 @@ mc_usage/             用量账本（按天生成，运行时产物）
 
 ## 贡献
 
-欢迎 Issue 与 Pull Request。提交信息建议使用 `feat:` / `fix:` / `docs:` / `chore:` 前缀，以便自动生成发布说明。
+欢迎 Issue 与 Pull Request。提交信息建议使用 `feat:` / `fix:` / `docs:` / `chore:` 前缀，方便归类阅读。
+
+## 特别致谢
+
+- **[mineflayer](https://github.com/PrismarineJS/mineflayer)** 与 **[PrismarineJS](https://github.com/PrismarineJS)**：整个项目的连接、物理与寻路都建立在它们之上。
+- **[minecraft-data](https://github.com/PrismarineJS/minecraft-data)**：方块、配方与协议数据的来源。
+- **[AstrBot](https://github.com/AstrBotDevs/AstrBot)**：小冰在聊天软件里的那一半，本来就是从这里来的。
+- **[MaiBot](https://github.com/Mai-with-u/MaiBot)**：本 README 的章节组织与「最像而不是好」的思路参考了它。
+
+## 注意事项
+
+> [!IMPORTANT]
+> 这是一个会自己走动的账号，请务必先和服务器管理员打过招呼再放它上线。
+> 它遵守服务器规则，不做刷资源、挂机刷物品或规避惩罚之类的事；用它做这些也不是这个项目的意图。
+> 模型生成的内容可能出错，请自行判断。
+
+- 上线前确认：账号权限、是否允许机器人在线、是否需要注册登录（本项目默认走 EasyAuth 的 `/register`、`/login`）。
+- 它只在自己被允许的地方动手：未登记的箱子不打开，别人正在盖的建筑不插手。
+- 出了问题先看日志和 `flags` 诊断，而不是反复指使它重试。
 
 ## License
 

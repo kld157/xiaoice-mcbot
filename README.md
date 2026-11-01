@@ -86,6 +86,35 @@ ACT {"id":"1","name":"goto","args":{"x":100,"y":64,"z":200}}
 
 结果覆盖写入 `act_out.json`，带 `id` 供配对。
 
+## 找方块：scan / mcscan.py
+
+给坐标常常只有 x、z 没有 y，这时候别猜，直接扫。`scan` 是**只读**动作，只回答
+「这片范围里有什么、在哪」，不动世界；它也是找箱子、找矿、找机关的统一入口。
+
+```bash
+# 命令行（默认找容器）
+python3 mcscan.py 'chest|barrel' --r 12
+python3 mcscan.py 'diamond_ore|deepslate_diamond_ore' --r 16 --limit 20
+python3 mcscan.py 'chest' --r 12 --register box   # 扫到就登记进 chests.json（名字 box1、box2…）
+```
+
+```python
+import mcscan
+mcscan.chests(r=12, ry=6)                  # 附近箱子/木桶，按距离排好
+mcscan.scan('oak_door', r=8, x=.., y=.., z=..)   # 指定中心扫
+mcscan.first('water')                      # 最近的第一个，没有就是 None
+mcscan.count('grass_block', r=6)           # 只要数量
+mcscan.group('chest|barrel|glass', r=10)   # 按名字统计
+mcscan.register_chests(r=12, prefix='box') # 登记容器，之后 chest:"box1" 直接开
+```
+
+动作参数：`{match, x,y,z, r 或 rx,ry,rz, y0,y1, limit, sort}`；
+`match` 支持 `"chest"` / `"chest,barrel"` / `"chest|barrel"` / 正则（含正则符号时按正则解释）。
+不给坐标就以 bot 脚下为中心；水平半径上限 32、上下半径上限 24，一次最多列 512 个。
+
+**限制**：只能扫服务器已加载的区块。远处会返回 `unloaded` 偏高，回执里会附一句
+「一半以上区块没加载，走近点再扫」——看到这句就是先 `goto` 靠近，不是箱子不存在。
+
 ## 架构
 
 ```
@@ -113,6 +142,7 @@ watchdog.sh          单实例守护，异常退出自动拉起
 install_mineflayer.sh 一键环境安装（幂等）
 where.js             注册/登录并报位置
 drift.js             registry 漂移检测（baseline / check）
+mcscan.py            通用「方块扫描」封装（scan 动作的 Python 壳 + CLI + 容器登记）
 chunk_scan.js        区块 stateId 全量扫描，找越界的 mod 方块
 skins/               皮肤生成与渲染脚本
 mc_usage/            token 账本（按天，运行时生成）

@@ -28,7 +28,7 @@ if __name__ == '__main__':
         players = e.get('players') or []
         if TARGET in players:
             log('发现 %s 在线，开打 L5' % TARGET)
-            r = send({'name': 'pvp', 'args': {'player': TARGET, 'skill': 5, 'secs': 45, 'stopHp': 6, 'hits': 2}}, timeout=120)
+            r = send({'name': 'pvp', 'args': {'player': TARGET, 'skill': 5, 'secs': 110, 'stopHp': 4, 'hits': 0}}, timeout=180)
             log('结果 ok=%s %s' % (r.get('ok'), r.get('msg')))
             break
         time.sleep(5)

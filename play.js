@@ -2263,6 +2263,54 @@ actRegister('redstone', () => {
   return { ok: true, msg: found.length ? `看到 ${found.length} 个红石元件` : '附近 6 格内没有红石元件', extra: { count: found.length, list: found.slice(0, 20) } };
 });
 
+// 通用「区块扫描」：按名字/正则找到一片范围内的方块（只读；只能扫服务器已加载的区块）
+// args: {match:"chest|barrel" | "chest,barrel" | 正则, x,y,z(可省，默认脚下), r | rx,ry,rz, y0,y1, limit, group}
+actRegister('scan', (a) => {
+  if (!bot || !bot.entity) return { ok: false, msg: '我还没上线' };
+  a = a || {};
+  const raw = String(a.match || a.block || a.name || 'chest|barrel').trim();
+  const metas = /[\\^$.*+?()[\]{}|]/.test(raw);
+  let re;
+  try {
+    const body = metas ? raw : raw.split(/[,\s]+/).filter(Boolean).join('|');
+    re = new RegExp('^(?:' + body + ')$');
+  } catch (e) { return { ok: false, msg: '匹配串写错了：' + raw }; }
+
+  const p = bot.entity.position.floored();
+  const cx = a.x !== undefined ? Math.floor(+a.x) : (a.near ? Math.floor(+a.near[0]) : p.x);
+  const cy = a.y !== undefined ? Math.floor(+a.y) : (a.near ? Math.floor(+a.near[1]) : p.y);
+  const cz = a.z !== undefined ? Math.floor(+a.z) : (a.near ? Math.floor(+a.near[2]) : p.z);
+  const clamp = (v, lo, hi, dv) => Math.min(hi, Math.max(lo, Number.isFinite(+v) ? +v : dv));
+  const rx = clamp(a.rx ?? a.r ?? 8, 0, 32, 8);
+  const rz = clamp(a.rz ?? a.r ?? 8, 0, 32, 8);
+  const ry = clamp(a.ry ?? Math.min(rx, rz), 0, 24, 4);
+  const y0 = a.y0 !== undefined ? Math.floor(+a.y0) : cy - ry;
+  const y1 = a.y1 !== undefined ? Math.floor(+a.y1) : cy + ry;
+  const limit = clamp(a.limit ?? 80, 1, 512, 80);
+
+  const found = []; let unloaded = 0, scanned = 0;
+  for (let x = cx - rx; x <= cx + rx; x++)
+    for (let y = y0; y <= y1; y++)
+      for (let z = cz - rz; z <= cz + rz; z++) {
+        scanned++;
+        const b = bot.blockAt(new Vec3(x, y, z));
+        if (!b) { unloaded++; continue; }
+        if (b.boundingBox === 'empty' || !re.test(b.name)) continue;
+        found.push({ name: b.name, pos: [x, y, z],
+          dist: +Math.sqrt((x + .5 - bot.entity.position.x) ** 2 + (y + .5 - bot.entity.position.y) ** 2 + (z + .5 - bot.entity.position.z) ** 2).toFixed(1) });
+      }
+  if (a.sort !== 'none') found.sort((m, n) => m.dist - n.dist);
+  const count = found.length;
+  const list = found.slice(0, limit);
+  const group = {};
+  for (const it of found) group[it.name] = (group[it.name] || 0) + 1;
+  const brief = Object.keys(group).sort((x, y) => group[y] - group[x]).slice(0, 6).map((k) => `${k}x${group[k]}`).join(',');
+  let msg = count ? `扫到 ${count} 个 [${raw}]` + (brief ? `：${brief}` : '') : `范围内没有 [${raw}]`;
+  if (unloaded > scanned * 0.5) msg += '（一半以上区块没加载，走近点再扫）';
+  if (count > limit) msg += `（只列最近的 ${limit} 个）`;
+  return { ok: true, msg, extra: { count, list, group, center: [cx, cy, cz], box: [rx, ry, rz], unloaded } };
+});
+
 function strip(t) { return t.replace(/§./g, '').trim(); }
 
 
@@ -4245,6 +4293,7 @@ const AUTO_MENU_LIST = [
   ['blueprint', '按图纸施工，args: {shape, player}'],
   ['cage', '检查自己是不是被屏障围住了'],
   ['redstone', '读一下周围红石元件的状态'],
+  ['scan', '扫一片范围找方块（只读）：args {match:"chest|barrel" 或 "chest,barrel" 或正则, x,y,z, r 或 rx,ry,rz, y0,y1, limit}；只能扫服务器已加载的区块'],
 ];
 const AUTO_MENU = AUTO_MENU_LIST.map(([n, d]) => `- ${n}：${d}`).join('\n');
 const AUTO_SET = new Set(AUTO_MENU_LIST.map(([n]) => n));

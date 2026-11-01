@@ -4874,12 +4874,17 @@ actRegister('chest', async (a) => {
   const cname = String((a && a.chest) || '').toLowerCase();
   const reg = loadChests();
   let block = null;
-  if (cname && reg[cname]) {
+  let stale = null;                          // 名字登记过、但那个坐标上箱子没了
+  if (a && a.x !== undefined && a.y !== undefined && a.z !== undefined) {
+    const b = bot.blockAt(new Vec3(Math.floor(+a.x), Math.floor(+a.y), Math.floor(+a.z)));
+    if (isContainerBlock(b)) block = b;      // 直接给坐标就用坐标（配合 scan 找出来的位置）
+  }
+  if (!block && cname && reg[cname]) {
     const c = reg[cname];
     const b = bot.blockAt(new Vec3(c[0], c[1], c[2]));
     if (isContainerBlock(b)) block = b;      // 记住过就直接去那儿（不靠「最近的箱子」瞎猜）
-    else { delete reg[cname]; saveChests(reg); }
-  } else if (!cname) {
+    else { stale = c.slice(); delete reg[cname]; saveChests(reg); }
+  } else if (!block && !cname) {
     block = findChestBlock(8);
   }
   let placedAt = null;
@@ -4897,7 +4902,15 @@ actRegister('chest', async (a) => {
     if (!block || block.boundingBox === 'empty') block = findChestBlock(8);
     if (cname && isContainerBlock(block)) { reg[cname] = [spot.x, spot.y, spot.z]; saveChests(reg); }
   }
-  if (!block) return { ok: false, msg: '附近没找到箱子（先用 store 放一个）', extra: { why: 'no_chest', placedAt } };
+  if (!block) {
+    let msg;
+    if (cname) {
+      msg = stale
+        ? `箱子「${cname}」原来在 ${stale.join(',')}，那儿现在没箱子了（用 scan 重新找一下，或给新名字我放一个）`
+        : `没登记过箱子「${cname}」，先用 scan 找到箱子坐标再带 x/y/z 打开，或 store 时给个新名字我放一个`;
+    } else msg = '附近没找到箱子（给个坐标，或先用 store 放一个）';
+    return { ok: false, msg, extra: { why: 'no_chest', stale, placedAt } };
+  }
 
   let cont;
   try { cont = await bot.openContainer(block); } catch (e) {

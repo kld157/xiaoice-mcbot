@@ -59,6 +59,9 @@ PERSONA = (
     "调完立刻回一句“开工啦”，不要自己反复调同一个工具；\n"
     "3) 说「过来/跟我」→ follow；「停/别动」→ stop；「过来我这边/坐标」→ goto；"
     "「挖掉这个」→ dig；「放个方块在这」→ place；「缺料」→ collect；\n"
+    "3b) 「找箱子/找XX方块/这附近有没有…」→ scan（只读扫描，坐标缺 y 也要先扫别猜）；"
+    "「存东西/取东西/看看箱子里」→ chest（保险箱叫 vault）；「做把剑/做几个木板」→ craft；"
+    "「吃东西/捡一下/穿护甲/有怪吗」→ eat / pickup / armor / mobs；\n"
     "4) 工具返回失败（比如背包没方块）就照实说一句，并给个办法（让它丢方块/让我去挖）；\n"
     "5) 一次回复最多调 2-3 个工具，别无限循环。\n"
     "6) 玩家说「和我PVP/来打一架/单挑/切磋」→ 调 pvp（默认 skill 3 收着打、血低就认输，绝不往死里打）；"
@@ -130,6 +133,48 @@ TOOLS = [
             "skill": {"type": "number", "description": "1 菜鸟到 5 不留余力，默认 3（会收着打）"},
             "secs": {"type": "number", "description": "打多久，6-120 秒，默认 30"},
             "stopHp": {"type": "number", "description": "自己血降到多少就认输，4-16，默认按档位"}}}}},
+    {"type": "function", "function": {
+        "name": "scan",
+        "description": "扫一片范围找方块（只读，找箱子/找矿/找机关都用它）：按名字匹配，返回数量和最近的几个坐标。坐标缺 y 就别猜，先扫。",
+        "parameters": {"type": "object", "properties": {
+            "match": {"type": "string", "description": "方块名，可多个：\"chest\" / \"chest,barrel\" / \"chest|barrel\" / 正则"},
+            "r": {"type": "number", "description": "水平半径，默认 8，最大 32"},
+            "ry": {"type": "number", "description": "上下半径，默认同 r 但不超过 4"},
+            "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
+            "limit": {"type": "number", "description": "最多列几个，默认 5"}},
+            "required": ["match"]}}},
+    {"type": "function", "function": {
+        "name": "chest",
+        "description": "用箱子：mode=list 看箱子里有什么；store 存东西（items 数组或 preset:\"junk\" 存杂物）；take 取东西。给 chest:\"名字\" 指定箱子（vault 是保险箱），不认识的箱子名会自动放新的并记住。",
+        "parameters": {"type": "object", "properties": {
+            "mode": {"type": "string", "description": "list / store / take，默认 store"},
+            "items": {"type": "array", "items": {"type": "string"}, "description": "物品英文 id，可带数量如 \"dirt:32\"；给 all 或 preset 时可省"},
+            "preset": {"type": "string", "description": "\"junk\" = 存预设的杂物清单"},
+            "chest": {"type": "string", "description": "箱子名，如 vault（只认登记过的名字）"},
+            "x": {"type": "number", "description": "可选：直接用坐标打开（配合 scan 找出来的箱子）"}, "y": {"type": "number"}, "z": {"type": "number"}}}}},
+    {"type": "function", "function": {
+        "name": "craft",
+        "description": "合成东西（木板/木棍/工作台/工具武器都行），没工作台会自己搓一张摆上。",
+        "parameters": {"type": "object", "properties": {
+            "item": {"type": "string", "description": "英文 id，如 wooden_sword"},
+            "count": {"type": "number"}}, "required": ["item"]}}},
+    {"type": "function", "function": {
+        "name": "eat", "description": "吃点背包里的东西回复饱食度。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "pickup", "description": "把附近掉在地上的东西捡起来。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "armor", "description": "换上背包里最好的护甲。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "mobs", "description": "列附近实体（动物/怪），找吃的或看有没有怪。",
+        "parameters": {"type": "object", "properties": {
+            "range": {"type": "number", "description": "搜索半径，默认 64"}}}}},
+    {"type": "function", "function": {
+        "name": "attack", "description": "打附近的怪（自动换武器/追击），默认最多 2 只、最多 15 秒。",
+        "parameters": {"type": "object", "properties": {
+            "count": {"type": "number"}, "secs": {"type": "number"}}}}},
 ]
 
 FAST_ACTIONS = {"perceive", "inventory", "build_status", "say", "stop", "jump", "build_house", "follow"}
@@ -338,6 +383,30 @@ def post_chat(msgs, tools=None, temp=0.95, max_tokens=200):
     raise RuntimeError(last or "全部模型失败")
 
 
+def brief_result(name, res):
+    """把回执压成一句话喂回模型（scan 之类一次几百个坐标会撑爆上下文）。"""
+    if not res.get("ok"):
+        return "失败：" + str(res.get("msg") or "")[:120]
+    ex = res.get("extra") or {}
+    if name == "scan":
+        items = ex.get("list") or []
+        txt = "共%s个" % ex.get("count")
+        g = ex.get("group") or {}
+        if g:
+            txt += "（" + ",".join("%s x%s" % (k, v) for k, v in list(g.items())[:6]) + "）"
+        if items:
+            txt += "；近的：" + "；".join(
+                "%s %s d%s" % (i.get("name"), i.get("pos"), i.get("dist")) for i in items[:5])
+        return txt[:400]
+    if name == "mobs":
+        return str(res.get("msg") or "")[:300]
+    if name == "chest" and ex.get("items"):
+        return (str(res.get("msg") or "")[:80] + " 内容：" +
+                json.dumps(ex["items"], ensure_ascii=False)[:300])
+    return (str(res.get("msg") or "")[:200] +
+            ("" if not ex else " " + json.dumps(ex, ensure_ascii=False)[:300]))
+
+
 def gen_reply(user, msg, history):
     """生成回复；模型可以调工具在游戏里干活。返回 (文本, pid, 动作记录)"""
     msgs = [{"role": "system", "content": PERSONA}]
@@ -373,8 +442,7 @@ def gen_reply(user, msg, history):
                                          res.get("ok"), str(res.get("msg"))[:60]))
             msgs.append({"role": "tool", "tool_call_id": tc.get("id") or name,
                          "name": name,
-                         "content": json.dumps({"ok": res.get("ok"), "msg": res.get("msg"),
-                                                "extra": res.get("extra")}, ensure_ascii=False)[:600]})
+                         "content": brief_result(name, res)})
         # 已经干了活，再要一轮话术就够了
     return "", pid, actions
 
@@ -517,10 +585,16 @@ def handle(items, state):
         del h[:-20]
         last[user] = time.time()
         if not reply:   # 只调了工具没说话：按动作给句兜底
+            oked = [a for a in acts if a.get("ok")]
+            bad = [a for a in acts if not a.get("ok")]
             if any(a.get("name") == "build_house" and a.get("ok") for a in acts):
                 reply = "开工啦～等我盖好喊你 ouo"
+            elif bad and not oked:          # 全失败就别嘴硬，照实说
+                reply = ("没弄成…" + str(bad[0].get("msg") or "")[:40]).strip()
+            elif acts:
+                reply = "好嘞，马上弄！"
             else:
-                reply = "好嘞，马上弄！" if acts else ""
+                reply = ""
         if not reply:
             continue
         log("LLM %s: %s  =>  %s  (%s) acts=%s" % (user, msg[:50], reply, pid,

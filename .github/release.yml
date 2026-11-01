@@ -1,0 +1,17 @@
+# GitHub 自动发布说明的分组规则（点 “Generate release notes” 时生效）
+# 前提：走 PR 流程 + PR 上打了对应 label。直接 commit 到 main 的不会被收录。
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+  categories:
+    - title: 新功能
+      labels: [feat, feature, enhancement]
+    - title: 修复
+      labels: [fix, bug, bugfix]
+    - title: 性能与重构
+      labels: [perf, refactor]
+    - title: 文档
+      labels: [docs]
+    - title: 其它
+      labels: ["*"]

@@ -240,7 +240,7 @@ function startFollow(ms = 60000, preferName) {
       if (COMBAT.active || fleeing) return;        // 打架优先，打完接着跟
       if (SELF_BUSY) return;                       // 正在砍树/合成，别抢
       if (!bot || !bot.entity) return stopFollow();
-      if (Date.now() > followUntil) { say('跟累啦，先歇会儿～'); return stopFollow(); }
+      if (Date.now() > followUntil) { say('跟累啦，先歇会儿～'); taskEnd('follow timeout'); return stopFollow(); }
       const target = (followTarget && followTarget.isValid) ? followTarget : nearestPlayer();
       if (!target || !target.position) { if ((missCount = (missCount || 0) + 1) < 8) return; say('咦，人呢？'); return stopFollow(); }
       missCount = 0;
@@ -310,7 +310,7 @@ function startFollow(ms = 60000, preferName) {
   return true;
 }
 
-const HELP = '我会：过来/跟我/带路（跟着你走）、拍我一下 + 走开（叫我跟着）、建房/盖个房子（自动选址+砌墙+封顶，没材料我自己去挖）、盖个塔/拱门/金字塔/围墙（按图纸施工）、有怪自动上去打（血少了会先跑）、停、跳、位置、转圈、说<话>、挖（挖脚下）、吃、背包';
+const HELP = '我会：过来/跟我/带路（跟着你走）、拍我一下 + 走开（叫我跟着）、建房/盖个房子（自动选址+砌墙+封顶，没材料我自己去挖）、盖个塔/拱门/金字塔/围墙（按图纸施工）、有怪自动上去打（血少了会先跑）、停、跳、位置、转圈、说<话>、挖（挖脚下）、吃、背包。两个人同时找我：先说的那个算主事人，后说的排进队（最多5个），这活干完自动接手；「停」只停自己的活，要强行打断就说「小冰停下别管他」';
 
 // ===== 「拍一下 + 走开」= 请求跟随 =====
 // 只拍不动 = 可能只是打着玩/试伤害，不当指令；
@@ -359,6 +359,7 @@ function triggerFollow(username, why) {
   lastActivity = Date.now();
   const already = !!followTimer && followTarget && followTarget.username === username;
   if (!startFollow(FOLLOW_MS, username)) { log(`HIT@ ${username} (${why}) -> no target`); return false; }
+  taskBegin(username, 'follow');
   log(`HIT@ ${username} (${why}) -> follow (确认走开)`);
   say(already ? '又拍我又走，我不是一直跟着嘛～'
               : (Math.random() < 0.5 ? '哦～拍完就走，懂了懂了，马上跟上！'
@@ -467,7 +468,91 @@ function smallTalk(username, msg) {
   setTimeout(() => { try { say(toGame); } catch (e) {} }, 400 + Math.random() * 600);
 }
 
-function handleChat(username, msg) {
+// ================= 指令归属 + 排队（2026-11-01）=================
+// 两个人同时下令时的规矩：
+//   1. 身体一次只干一件事，先说的人当「主事人」(owner)；
+//   2. 别人的动作指令不丢，排进队列（最多 5 个），当前这活儿干完自动接手；
+//   3. 非主事人的「停」默认不生效，免得把别人正在被干的活误停掉；
+//   4. 点名要人（"来我这/带我"）可以抢，但会说一句先不跟谁了。
+// 查询和表情类（位置/背包/跳/帮助/调试）即时回应，不排队也不抢归属。
+const QUEUE_MAX = 5;
+const TASK = { owner: null, kind: null, since: 0, queue: [] };
+
+const ACTION_RE = /(来我这|来这边|来我这儿|带我|过来|come|跟我|跟着我|follow|带路|领路|走前面|建房|盖|造|搭|小屋|房子|填|堵|封|井|坑|洞|水面|游泳|潜水|下水|游过去|挖|dig|吃|eat)/i;
+const INSTANT_RE = /^(位置|坐标|where|pos|背包|物品|inv|帮助|help|指令|调试|debug|diag|跳|jump|转圈|spin|说|say|测|test|模拟|mock)/i;
+const isActionCmd = (b) => ACTION_RE.test(b) && !INSTANT_RE.test(b);
+const isStopCmd = (b) => /^(停|停下|stop|别动|取消|停手|站住|待着)/i.test(b) || /(别|不要|不用|甭)(跟着|跟我|过来|建|盖)/.test(b);
+const isExplicitSteal = (b) => /(来我这|过来|来这边|带我|跟我|跟我走|跟着我|带路)/.test(b);
+
+// 主事人是否还有效（跟随看 followTimer，建房看 BUILD.active，其余 90 秒保险到期）
+function taskOwner() {
+  if (!TASK.owner) return null;
+  const age = Date.now() - TASK.since;
+  const alive = (TASK.kind === 'follow' && !!followTimer) ||
+                (TASK.kind === 'build' && BUILD.active) ||
+                (TASK.kind === 'cmd' && age < 90000);
+  if (!alive) { TASK.owner = null; TASK.kind = null; }
+  return TASK.owner;
+}
+
+function taskBegin(user, kind) {
+  TASK.owner = user || null;
+  TASK.kind = kind || 'cmd';
+  TASK.since = Date.now();
+}
+
+function taskEnd(reason) {
+  if (!TASK.owner) return;
+  log(`TASK end ${TASK.owner}/${TASK.kind} (${reason || ''})`);
+  TASK.owner = null; TASK.kind = null;
+  setTimeout(pumpQueue, 800);        // 干完了，看看有没有人在排队
+}
+
+function queuePush(user, raw) {
+  if (TASK.queue.length >= QUEUE_MAX) return false;
+  TASK.queue.push({ user, raw: String(raw).slice(0, 120), ts: Date.now() });
+  return true;
+}
+
+function pumpQueue() {
+  if (taskOwner()) return;           // 还在干活，等下一个结束钩子
+  const nx = TASK.queue.shift();
+  if (!nx) return;
+  const waited = Math.round((Date.now() - nx.ts) / 1000);
+  log(`QUEUE run ${nx.user} "${nx.raw}" waited=${waited}s left=${TASK.queue.length}`);
+  say(`${nx.user}，你等的活儿我来了（排了 ${waited} 秒）～`);
+  setTimeout(() => { try { handleChat(nx.user, nx.raw, true); } catch (e) { log('QUEUE ERR ' + (e.message || e)); } }, 700);
+}
+
+// 返回 true = 这条指令已被归属/排队消化掉，不用再往下执行
+function commandGate(user, body) {
+  if (!body) return false;
+  const owner = taskOwner();
+
+  if (isStopCmd(body)) {
+    const force = /(别管他|别管她|不管他|不管谁|强行|硬停)/.test(body);
+    if (!owner || owner === user || force) { taskEnd('stop'); return false; }   // 自己的活，正常停
+    say(`我是被 ${owner} 叫去干活的…真想让我停就说「小冰停下别管他」`);
+    return true;
+  }
+
+  if (!isActionCmd(body)) return false;          // 查询/表情类直接放行
+  if (!owner) { taskBegin(user, 'cmd'); return false; }
+  if (owner === user) return false;              // 本来就是他的活
+
+  if (isExplicitSteal(body) && !BUILD.active) {  // 点名抢人
+    say(`那我先不跟 ${owner} 了，跟你走～`);
+    taskEnd('steal');
+    taskBegin(user, 'cmd');
+    return false;
+  }
+
+  if (queuePush(user, body)) say(`手上还有活儿（在帮 ${owner} 干），先记下你的了，排第 ${TASK.queue.length} 个～`);
+  else say(`排队排满了（${QUEUE_MAX} 个），等我干完这些，或者喊「小冰停下」`);
+  return true;
+}
+
+function handleChat(username, msg, internal) {
   if (!msg) return;
   const raw = msg.trim();
   const low = raw.toLowerCase();
@@ -488,6 +573,9 @@ function handleChat(username, msg) {
   const np = nearestPlayer();
   log(`cmd from ${username}: "${raw}" body="${body}" nearest=${np ? np.username + '@' + np.position.distanceTo(bot.entity.position).toFixed(1) : 'none'}`);
 
+  // 归属 + 排队闸门（队列回放的指令 internal=true，不重复过闸）
+  if (!internal && commandGate(username, body)) return;
+
   // 正在干活时的"免打扰"
   if (BUILD.active && !/^(停|停下|stop|别动|取消|停手|停一下)/i.test(body) && !/别(建|盖|造|搭)/.test(body)) {
     llmSay(`${sceneNow()}。${username}刚跟你说：「${body}」。你现在手上有活儿，回一句让他稍等，别太啰嗦。`, null, true);
@@ -497,20 +585,22 @@ function handleChat(username, msg) {
   if (followTimer) followUntil = Date.now() + FOLLOW_MS;   // 有人还在说话就继续跟着
 
   if (intent && intent.kind === 'stop') {
-    if (BUILD.active) { BUILD.abort = true; say('好～我停工，站这儿等你'); return; }
-    stopFollow(); say('好，我站住了');
+    if (BUILD.active) { BUILD.abort = true; say('好～我停工，站这儿等你'); taskEnd('abort'); return; }
+    stopFollow(); taskEnd('stop'); say('好，我站住了');
   } else if (intent && intent.kind === 'follow') {
     const already = !!followTimer && followTarget && followTarget.username === username;
-    if (!startFollow(FOLLOW_MS, username)) say('附近没看到人呀…');
+    const ok = startFollow(FOLLOW_MS, username);
+    if (ok) taskBegin(username, 'follow');
+    if (!ok) say('附近没看到人呀…');
     else if (already) say('一直跟着呢，你别乱跑哦～');
     else if (intent.lead) say('带路？我认路超差的…你走前面，我跟着你');
     else say(username === 'console' ? '来啦来啦，等等我～' : `来啦来啦，${username}等等我～`);
   } else if (/^(过来|come|跟我|跟着我|follow)/i.test(body)) {
-    if (startFollow(FOLLOW_MS, username)) say(`来啦来啦，${username}等等我～`);
+    if (startFollow(FOLLOW_MS, username)) { taskBegin(username, 'follow'); say(`来啦来啦，${username}等等我～`); }
     else say('附近没看到人呀…');
   } else if (/^(停|停下|stop|别动)/i.test(body)) {
-    if (BUILD.active) { BUILD.abort = true; say('好～我停工，站这儿等你'); }
-    else { stopFollow(); say('好，我站住了'); }
+    if (BUILD.active) { BUILD.abort = true; taskEnd('abort'); say('好～我停工，站这儿等你'); }
+    else { stopFollow(); taskEnd('stop'); say('好，我站住了'); }
   } else if (/^(模拟拍|测试拍|假拍)/i.test(body)) {
     if (noteHit(username, 'debug')) say('（模拟）拍到啦，我先不动…你走开两步试试？');
     else say('没记上（可能没看我／冷却中／看不到你）');
@@ -1004,6 +1094,7 @@ async function buildHouse(username) {
   }
   BUILD.active = true; BUILD.abort = false; BUILD.abortQuiet = false; BUILD.placed = 0; BUILD.failed = 0;
   BUILD.who = username;
+  taskBegin(username, 'build');
   stopFollow();
   try {
     const req = entityByName(username) || nearestPlayer(40);
@@ -1090,6 +1181,7 @@ async function buildHouse(username) {
   } finally {
     try { ['forward', 'jump', 'left', 'right', 'sprint'].forEach(k => bot.setControlState(k, false)); } catch (e) {}
     BUILD.active = false;
+    taskEnd(BUILD.abort ? 'build abort' : 'build done');
   }
 }
 

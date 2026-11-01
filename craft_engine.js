@@ -179,7 +179,7 @@ function createPlanner(options) {
     const need = count - have;
     const recs = recipesFor(name);
     if (!recs.length) {
-      noteMissing(state, name, need, have);
+      noteMissing(state, name, count, have);
       return false;
     }
 
@@ -246,15 +246,16 @@ function createPlanner(options) {
       });
       return true;
     }
-    noteMissing(state, name, need, have);
+    noteMissing(state, name, count, have);
     return false;
   }
 
+  // need 一律是「总共要多少」，have 是「手上有多少」；缺口 = need - have。
+  // （以前这里混传过「差额」，库存不为 0 时缺口会被算成负数，need 就报「配方算不出来」）
   function noteMissing(state, name, need, have) {
     const prev = state.missing.get(name);
-    if (!prev || prev.need > need) {
-      state.missing.set(name, { name, need: Math.max(need, 1), have });
-    }
+    const info = { name, need: Math.max(need, 1), have };
+    if (!prev || (info.need - info.have) > (prev.need - prev.have)) state.missing.set(name, info);
   }
 
   /**

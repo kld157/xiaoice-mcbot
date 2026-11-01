@@ -280,7 +280,8 @@ mc_usage/             用量账本（按天生成，运行时产物；供 AstrBo
 - **[minecraft-data](https://github.com/PrismarineJS/minecraft-data)**：方块、配方与协议数据的来源。
 - **[AstrBot](https://github.com/AstrBotDevs/AstrBot)**：小冰在聊天软件里的那一半，本来就是从这里来的。
   > 注：AstrBot **仅**用于聊天侧接入（让小冰在 QQ / 频道里说话）；**MC 机器人本体不依赖 AstrBot**，不装它也能直接 `./start.sh` 独立运行。
-- **[MaiBot](https://github.com/Mai-with-u/MaiBot)**：本 README 的章节组织与「最像而不是好」的思路参考了它。
+- **[MaiBot](https://github.com/Mai-with-u/MaiBot)**：本项目的**设计思路参考** —— README 的章节组织、「最像而不是好」这套表达方式，都受了它启发。
+  > 注：**仅**为项目设计思路参考，本项目不含 MaiBot 的任何代码，也不依赖它运行。
 
 ## 注意事项
 

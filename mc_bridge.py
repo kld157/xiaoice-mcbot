@@ -194,6 +194,33 @@ TOOLS = [
         "name": "attack", "description": "打附近的怪（自动换武器/追击），默认最多 2 只、最多 15 秒。",
         "parameters": {"type": "object", "properties": {
             "count": {"type": "number"}, "secs": {"type": "number"}}}}},
+    {"type": "function", "function": {
+        "name": "sleep", "description": "找床睡觉（天黑才有用，白天会被弹起来）。附近没床会说缺材料。",
+        "parameters": {"type": "object", "properties": {
+            "range": {"type": "number", "description": "找床半径，默认 32"},
+            "force": {"type": "boolean", "description": "白天也要硬躺（调试用）"}}}}},
+    {"type": "function", "function": {
+        "name": "farm", "description": "种田：收成熟作物 / 用锄头把草方块泥土翻成耕地 / 给空耕地补种。mode 可填 auto(默认)、harvest、till、plant。",
+        "parameters": {"type": "object", "properties": {
+            "mode": {"type": "string", "description": "harvest / plant，不给就两样都干"},
+            "range": {"type": "number", "description": "工作半径，默认 24"}}}}},
+    {"type": "function", "function": {
+        "name": "trade", "description": "找村民交易。不给 index 就只报交易菜单；给 index（第几笔，从 0 数）和 count 才真的换。",
+        "parameters": {"type": "object", "properties": {
+            "index": {"type": "number", "description": "第几笔交易，从 0 开始"},
+            "count": {"type": "number", "description": "换几次，默认 1"},
+            "range": {"type": "number", "description": "找村民半径，默认 32"}}}}},
+    {"type": "function", "function": {
+        "name": "shoot", "description": "用弓射箭。给 target 就射那个人/生物，不给就射最近的敌对怪。",
+        "parameters": {"type": "object", "properties": {
+            "target": {"type": "string", "description": "目标玩家名或生物名"},
+            "count": {"type": "number", "description": "射几箭，最多 5，默认 1"},
+            "range": {"type": "number", "description": "找怪半径，默认 24"}}}}},
+    {"type": "function", "function": {
+        "name": "ride", "description": "上附近的船/矿车/马（马要鞍）。已经在车上就下来。背包里有船时给 place=true 会自己放一艘。",
+        "parameters": {"type": "object", "properties": {
+            "range": {"type": "number", "description": "找载具半径，默认 16"},
+            "place": {"type": "boolean", "description": "旁边没载具时自己放一艘船"}}}}},
 ]
 
 FAST_ACTIONS = {"perceive", "inventory", "build_status", "say", "stop", "jump", "build_house", "follow",

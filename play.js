@@ -3539,6 +3539,34 @@ async function actDigOut() {
   return false;
 }
 
+// 直线走：这服寻路老超时，直接朝目标方向按住前进 + 卡住就跳
+async function walkStraightTo(target, maxMs = 20000, stopDist = 2.2) {
+  const t0 = Date.now();
+  let last = bot.entity.position.clone(), stuck = 0;
+  try { bot.pathfinder.setGoal(null); } catch (e) {}
+  try {
+    while (Date.now() - t0 < maxMs) {
+      const p = bot.entity.position;
+      const dx = target.x - p.x, dz = target.z - p.z;
+      const d = Math.hypot(dx, dz);
+      if (d <= stopDist) break;
+      const yaw = Math.atan2(-dx, -dz);
+      await bot.look(yaw, 0, true).catch(() => {});
+      bot.setControlState('forward', true);
+      if (d > 6) bot.setControlState('sprint', true);
+      await new Promise((r) => setTimeout(r, 220));
+      const moved = Math.hypot(p.x - last.x, p.z - last.z);
+      stuck = moved < 0.12 ? stuck + 1 : 0;
+      last = p.clone();
+      if (stuck >= 2) { bot.setControlState('jump', true); await new Promise((r) => setTimeout(r, 120)); bot.setControlState('jump', false); stuck = 0; }
+    }
+  } catch (e) { log('WALK> ' + (e.message || e)); }
+  bot.setControlState('forward', false);
+  bot.setControlState('sprint', false);
+  try { bot.pathfinder.setGoal(null); } catch (e) {}
+  return bot.entity.position.distanceTo(target);
+}
+
 async function actWander() {
   const f = bot.entity.position, ang = Math.random() * Math.PI * 2, d = 4 + Math.random() * 4;
   const tx = Math.floor(f.x + Math.cos(ang) * d), tz = Math.floor(f.z + Math.sin(ang) * d);
@@ -4137,12 +4165,33 @@ actRegister('fish', async (a) => {
   const limit = Math.max(8000, Math.min(60000, parseInt((a && a.timeout) || 25000, 10) || 25000));
   const rod = bot.inventory.items().find((i) => /fishing_rod$/.test(i.name));
   if (!rod) return { ok: false, msg: '没有钓竿，先 craft fishing_rod（3 木棍 + 2 线）' };
-  const W = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 24 });
-  if (!W) return { ok: false, msg: '附近 24 格内没找到水，钓不了' };
-  if (bot.entity.position.distanceTo(W.position) < 3) {
-    // 站太近就往上/旁边挪一格，免得浮标糊自己一脸
-    const back = bot.entity.position.offset(0, 0, 0);
-    void back;
+  // 天黑就别钓了，僵尸专挑钓鱼的时候偷袭
+  const tod = (bot.time && bot.time.timeOfDay) || 0;
+  if (!(a && a.force) && tod > 12900 && tod < 23100) {
+    return { ok: false, msg: '天黑了（time=' + tod + '），等天亮再钓，不然要被僵尸咬' };
+  }
+  let W = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 12 })
+    || bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 64 });
+  if (!W) return { ok: false, msg: '附近 64 格内没找到水，钓不了' };
+  // 找到了但离得远，先走过去（站到水里 3 格内的岸上）
+  const dW = bot.entity.position.distanceTo(W.position);
+  if (dW > 3.2) {
+    // 直接朝水走（这服 pathfinder 会 "Took to long to decide path"），一步步靠近
+    let tries = 0;
+    while (tries++ < 3 && bot.entity.position.distanceTo(W.position) > 3.2) {
+      const Wc = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 40 }) || W;
+      W = Wc;
+      const left = await walkStraightTo(W.position, 12000, 2.4);
+      log('FISH> 靠近水 剩 ' + left.toFixed(1) + ' 格');
+      if (left <= 3.2) break;
+    }
+    const W2 = bot.findBlock({ matching: (b) => b && b.name === 'water', maxDistance: 5 });
+    if (W2) W = W2;
+    const dNow = bot.entity.position.distanceTo(W.position);
+    if (dNow > 6.5) {
+      return { ok: false, msg: '看到水了，但走不过去（还差 ' + dNow.toFixed(1) + ' 格）' };
+    }
+    await bot.lookAt(W.position.offset(0.5, 0.5, 0.5), true).catch(() => {});
   }
   await bot.equip(rod, 'hand').catch(() => {});
   await bot.lookAt(W.position.offset(0.5, 0.5, 0.5), true).catch(() => {});
@@ -4284,7 +4333,7 @@ const AUTO_MENU_LIST = [
   ['pickup', '把附近的掉落物捡了'],
   ['eat', '吃点背包里的东西垫肚子'],
   ['mobs', '列附近实体/动物（找吃的、找怪都用它），args: {range:64}'],
-  ['fish', '在附近水里钓鱼（需要钓竿），args: {casts:3, timeout:25000}'],
+  ['fish', '在附近水里钓鱼（需要钓竿，64 格内找水、会走过去；天黑不下钩），args: {casts:3, timeout:25000, force:false}'],
   ['chest', '存/取/看箱子（清背包唯一有效的办法，toss 会被服务器回滚），args: {mode:"store|take|list", items:[...], preset:"junk", chest:"箱子名"}。给个新名字会自动新放一个箱子并记住坐标，比如 chest:"vault" 当保险箱'],
   ['armor', '换上背包里最好的护甲'],
   ['craft', '搓东西（木板/木棍/工作台/工具武器都行），args: {item:"英文id", count}；没工作台会自己搓一张摆上'],

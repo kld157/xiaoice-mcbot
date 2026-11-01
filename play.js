@@ -1156,6 +1156,7 @@ function perceive() {
       blocks: near, players, mats: matCount(),
       building: BUILD.active, placed: BUILD.placed,
       following: !!followTarget,
+      goal: goalBrief(), waypoints: Object.keys(loadWps()).length,
     },
   };
 }
@@ -1402,8 +1403,17 @@ actRegister('sprint', async (a) => {
 });
 actRegister('goto', async (a) => {
   let target = null;
-  if (a.x !== undefined && a.y !== undefined && a.z !== undefined) target = new Vec3(+a.x, +a.y, +a.z);
-  else {
+  let wpHit = null;
+  const wpName = normName((a && (a.to || a.waypoint || a.place)) || '');
+  if (wpName) {                                   // 有路标就直接照着路标走，别让模型自己编坐标
+    wpHit = wpAt(wpName);
+    if (!wpHit) {
+      return { ok: false, msg: `没记住「${wpName}」这个路标（说「记住这儿叫 ${wpName}」我就记）`, extra: { why: 'no_waypoint', have: Object.keys(loadWps()).slice(0, 10) } };
+    }
+    target = new Vec3(wpHit.pos[0], wpHit.pos[1], wpHit.pos[2]);
+  }
+  if (!target && a.x !== undefined && a.y !== undefined && a.z !== undefined) target = new Vec3(+a.x, +a.y, +a.z);
+  if (!target) {
     const t = (a.player && entityByName(a.player)) || nearestPlayer(64);
     if (t && t.position) target = t.position.clone();
   }
@@ -1411,10 +1421,16 @@ actRegister('goto', async (a) => {
   stopFollow();
   const d0 = bot.entity.position.distanceTo(target);
   if (d0 > 40) return { ok: false, msg: `太远了（${d0.toFixed(0)} 格），先说「过来」跟着走` };
+  let wrongDim = '';
+  if (wpHit && wpHit.dim && wpHit.dim !== bot.game.dimension) wrongDim = `（路标记在 ${wpHit.dim}，现在在 ${bot.game.dimension}）`;
   await walkTo(target, 2.2, Math.min(25000, 3000 + d0 * 450));
   const d = bot.entity.position.distanceTo(target);
   if (d >= 4.5) setTimeout(() => { selfRescue('想走过去但走不动'); }, 300);
-  return { ok: d < 4.5, msg: d < 4.5 ? '到了' : `还差 ${d.toFixed(1)} 格没走过去`, extra: { dist: +d.toFixed(1) } };
+  return {
+    ok: d < 4.5,
+    msg: (d < 4.5 ? (wpHit ? `到「${wpHit.name}」了` : '到了') : `还差 ${d.toFixed(1)} 格没走过去`) + wrongDim,
+    extra: { dist: +d.toFixed(1), waypoint: wpHit ? wpHit.name : null },
+  };
 });
 function nearestDiggable(target, r = 3) {
   let best = null, bd = 1e9;
@@ -5185,6 +5201,7 @@ actRegister('chest', async (a) => {
     return { ok: false, msg, extra: { why: 'no_chest', stale, placedAt } };
   }
 
+  const ck = cname || ('chest@' + block.position.x + ',' + block.position.y + ',' + block.position.z);
   let cont;
   try { cont = await bot.openContainer(block); } catch (e) {
     return { ok: false, msg: '打不开箱子：' + ((e && e.message) || e), extra: { why: 'open_failed', placedAt } };
@@ -5238,8 +5255,242 @@ actRegister('chest', async (a) => {
   } catch (e) {
     return { ok: false, msg: '存取箱子出错：' + ((e && e.message) || e), extra: { placedAt } };
   } finally {
+    try { snapshotChest(ck, cont.containerItems()); } catch (e) {}   // 顺手记存货，need 算账时不用再跑一趟
     try { cont.close(); } catch (e) {}
   }
+});
+
+// ---------- 空间记忆 / 跨轮目标 / 缺口规划（③④⑤） ----------
+const WP_FILE = path.join(__dirname, 'waypoints.json');
+const GOAL_FILE = path.join(__dirname, 'goal.json');
+const GOAL_LOG = path.join(__dirname, 'goal_log.jsonl');
+const CHEST_STOCK_FILE = path.join(__dirname, 'chest_stock.json');
+
+function readJsonFile(p, dflt) {
+  try { const o = JSON.parse(fs.readFileSync(p, 'utf8')); return (o && typeof o === 'object') ? o : dflt; } catch (e) { return dflt; }
+}
+function writeJsonFile(p, o) {
+  try {
+    if (o === null) { try { fs.unlinkSync(p); } catch (e) {} return; }
+    fs.writeFileSync(p, JSON.stringify(o, null, 2));
+  } catch (e) { log('jsonWrite ' + p + ' ' + (e.message || e)); }
+}
+function normName(n) { return String(n || '').trim().toLowerCase().replace(/\s+/g, '_').slice(0, 24); }
+
+// ---- ④ 路标：家在哪儿、水塘在哪儿，不用每回都扫一遍 ----
+function loadWps() { return readJsonFile(WP_FILE, {}); }
+function saveWps(o) { writeJsonFile(WP_FILE, o); }
+function wpAt(name) {
+  const w = loadWps()[normName(name)];
+  if (!w || !Array.isArray(w.pos) || w.pos.length !== 3) return null;
+  return { name: normName(name), pos: w.pos.map(Number), dim: w.dim || '', note: w.note || '', ts: w.ts || 0 };
+}
+function wpDist(w) {
+  if (!w || !bot || !bot.entity) return null;
+  const p = bot.entity.position;
+  return +Math.hypot(w.pos[0] - p.x, w.pos[1] - p.y, w.pos[2] - p.z).toFixed(1);
+}
+function wpBriefList(limit) {
+  const all = loadWps();
+  const rows = Object.keys(all).map((n) => {
+    const w = all[n] || {};
+    return { name: n, pos: w.pos || [], dim: w.dim || '', note: w.note || '', ts: w.ts || 0 };
+  });
+  rows.forEach((r) => { r.dist = wpDist(r); });
+  rows.sort((x, y) => (x.dist === null ? 1e9 : x.dist) - (y.dist === null ? 1e9 : y.dist));
+  return rows.slice(0, limit || 12);
+}
+
+actRegister('waypoint', async (a) => {
+  if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };
+  const op = String((a && (a.op || a.mode)) || 'list').toLowerCase();
+  const name = normName(a && (a.name || a.waypoint || a.place));
+  const all = loadWps();
+
+  if (op === 'set' || op === 'add' || op === 'mark' || op === 'remember') {
+    if (!name) return { ok: false, msg: '要个路标名字，比如 home / mine1 / 水塘' };
+    const hasXYZ = a.x !== undefined && a.y !== undefined && a.z !== undefined;
+    const p = hasXYZ
+      ? [Math.floor(+a.x), Math.floor(+a.y), Math.floor(+a.z)]
+      : [Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z)];
+    all[name] = { pos: p, dim: bot.game.dimension, note: String(a.note || '').slice(0, 60), ts: Date.now() };
+    saveWps(all);
+    return { ok: true, msg: `记住「${name}」在 ${p.join(',')}${a.note ? '（' + a.note + '）' : ''}`, extra: { name, pos: p, total: Object.keys(all).length } };
+  }
+  if (op === 'del' || op === 'delete' || op === 'rm' || op === 'forget') {
+    if (!name) return { ok: false, msg: '要删哪个路标？给我名字' };
+    if (!all[name]) return { ok: false, msg: `没记住「${name}」`, extra: { have: Object.keys(all).slice(0, 10) } };
+    delete all[name]; saveWps(all);
+    return { ok: true, msg: `忘了「${name}」`, extra: { total: Object.keys(all).length } };
+  }
+  if (op === 'go' || op === 'goto' || op === 'walk') {
+    if (!name) return { ok: false, msg: '要去哪个路标？给我名字' };
+    return await ACTIONS.goto({ to: name });
+  }
+  const w = name ? wpAt(name) : null;
+  if (name && !w) return { ok: false, msg: `没记住「${name}」这个路标`, extra: { have: Object.keys(all).slice(0, 10) } };
+  if (w) return { ok: true, msg: `路标「${w.name}」在 ${w.pos.join(',')}，离我 ${wpDist(w)} 格${w.note ? '，' + w.note : ''}`, extra: w };
+  const rows = wpBriefList();
+  if (!rows.length) return { ok: true, msg: '还一个路标都没记（说「记住这里叫 home」我就记下）', extra: { total: 0 } };
+  return {
+    ok: true,
+    msg: `路标 ${rows.length} 个：` + rows.map((r) => `${r.name}(${r.pos.join(',')}${r.dist === null ? '' : ' ' + r.dist + '格'})`).join('；'),
+    extra: { total: rows.length, list: rows },
+  };
+});
+
+// ---- ③ 当前目标：聊两句也不会忘自己在干嘛 ----
+function loadGoal() {
+  const g = readJsonFile(GOAL_FILE, null);
+  if (!g || !g.text) return null;
+  g.steps = Array.isArray(g.steps) ? g.steps.map(String) : [];
+  g.done = Array.isArray(g.done) ? g.done.filter((i) => Number.isInteger(i)) : [];
+  return g;
+}
+function saveGoal(g) { writeJsonFile(GOAL_FILE, g); }
+function goalNext(g) {
+  if (!g || !g.steps.length) return null;
+  const i = g.steps.findIndex((s, k) => g.done.indexOf(k) < 0);
+  return i < 0 ? null : { idx: i, text: g.steps[i] };
+}
+function goalBrief() {
+  const g = loadGoal();
+  if (!g) return null;
+  const nx = goalNext(g);
+  const age = Math.round((Date.now() - (g.updated || g.created || Date.now())) / 60000);
+  let s = g.text;
+  if (g.steps.length) s += `（${g.done.length}/${g.steps.length}步` + (nx ? `，下一步：${nx.text}` : '，步骤干完就收尾') + '）';
+  if (age >= 30) s += `｜挂了 ${age} 分钟没动`;
+  return s;
+}
+function closeGoal(g, how) {
+  try { fs.appendFileSync(GOAL_LOG, JSON.stringify({ text: g.text, steps: g.steps, done: g.done, closed: how, closedAt: Date.now() }) + '\n'); } catch (e) {}
+  saveGoal(null);
+}
+
+actRegister('goal', async (a) => {
+  const op = String((a && (a.op || a.mode)) || 'status').toLowerCase();
+  const g = loadGoal();
+
+  if (op === 'set' || op === 'new' || op === 'start') {
+    const text = String((a && (a.text || a.goal || a.what)) || '').trim().slice(0, 80);
+    if (!text) return { ok: false, msg: '目标写短点给我，比如「盖完木头小屋」' };
+    let steps = a && a.steps;
+    if (typeof steps === 'string') steps = steps.split(/[,，、;；\n]+/);
+    steps = Array.isArray(steps) ? steps.map((s) => String(s).trim()).filter(Boolean).slice(0, 12) : [];
+    saveGoal({ text, steps, done: [], created: Date.now(), updated: Date.now() });
+    return { ok: true, msg: `记下了：${text}` + (steps.length ? `（${steps.length} 步：${steps.join(' → ')}）` : ''), extra: { text, steps } };
+  }
+  if (!g) return { ok: op === 'status' || op === 'list' || op === 'show', msg: '现在手上没挂目标（想挂就说：先把房子盖完）', extra: { goal: null } };
+  if (op === 'step' || op === 'tick' || op === 'check') {
+    const nx = goalNext(g);
+    const want = a && (a.step !== undefined ? a.step : a.text);
+    let idx = -1;
+    if (typeof want === 'number' || /^\d+$/.test(String(want === undefined ? '' : want))) idx = parseInt(want, 10) - 1;
+    else if (want) idx = g.steps.findIndex((s) => s.indexOf(String(want)) >= 0);
+    else if (nx) idx = nx.idx;
+    if (!g.steps.length) return { ok: false, msg: '这个目标没写步骤，直接说「目标完成了」我就收尾' };
+    if (idx < 0 || idx >= g.steps.length) return { ok: false, msg: `没这一步：${want}`, extra: { steps: g.steps } };
+    if (g.done.indexOf(idx) < 0) g.done.push(idx);
+    g.updated = Date.now(); saveGoal(g);
+    const after = goalNext(g);
+    return {
+      ok: true,
+      msg: `第 ${idx + 1} 步「${g.steps[idx]}」干完（${g.done.length}/${g.steps.length}）` + (after ? `，下一步：${after.text}` : '，全干完了，说一声我收尾'),
+      extra: { done: g.done.length, total: g.steps.length, next: after ? after.text : null },
+    };
+  }
+  if (op === 'done' || op === 'finish' || op === 'end') {
+    closeGoal(g, 'done');
+    return { ok: true, msg: `目标完成：${g.text}` + (g.steps.length ? `（${g.done.length}/${g.steps.length} 步）` : '') + '，记进账本了', extra: { text: g.text } };
+  }
+  if (op === 'clear' || op === 'drop' || op === 'cancel') {
+    closeGoal(g, 'dropped');
+    return { ok: true, msg: `不挂着了：${g.text}` };
+  }
+  const nx = goalNext(g);
+  return {
+    ok: true,
+    msg: `当前目标：${g.text}` + (g.steps.length ? `（${g.done.length}/${g.steps.length} 步）` : '') + (nx ? `；下一步：${nx.text}` : ''),
+    extra: { text: g.text, steps: g.steps, done: g.done, next: nx ? nx.text : null },
+  };
+});
+
+// ---- ⑤ 缺口规划：箱子开过就记一份存货，算账不用再跑一趟 ----
+function loadChestStock() { return readJsonFile(CHEST_STOCK_FILE, {}); }
+function saveChestStock(o) { writeJsonFile(CHEST_STOCK_FILE, o); }
+function snapshotChest(key, items) {
+  if (!key) return;
+  const o = loadChestStock();
+  const bag = {};
+  (items || []).forEach((i) => { bag[i.name] = (bag[i.name] || 0) + i.count; });
+  o[key] = { items: bag, updated: Date.now() };
+  saveChestStock(o);
+}
+function chestStockTotals() {
+  const o = loadChestStock(); const tot = {};
+  for (const k in o) { const bag = o[k].items || {}; for (const n in bag) tot[n] = (tot[n] || 0) + bag[n]; }
+  return tot;
+}
+function mergeCounts() {
+  const out = {};
+  for (const m of Array.prototype.slice.call(arguments)) { if (!m) continue; for (const n in m) out[n] = (out[n] || 0) + m[n]; }
+  return out;
+}
+function chestStockAge() {
+  const o = loadChestStock(); const ks = Object.keys(o);
+  if (!ks.length) return null;
+  return Math.round((Date.now() - Math.max.apply(null, ks.map((k) => o[k].updated || 0))) / 60000);
+}
+
+actRegister('need', async (a) => {
+  if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };
+  const raw = (a && (a.items || a.item || a.name || a.thing)) || '';
+  let list = Array.isArray(raw) ? raw.map(String) : String(raw).split(/[,，、;；\s]+/).filter(Boolean);
+  if (!list.length) return { ok: false, msg: '要算什么？给 item，比如 iron_pickaxe 或 iron_pickaxe:2,torch:16' };
+  list = list.slice(0, 4);
+  const useChest = !(a && (a.chest === false || a.includeChests === false));
+  const inv = invSnapshot();
+  const chest = useChest ? chestStockTotals() : {};
+  const stock = mergeCounts(inv, chest);
+  const planner = getPlanner();
+  const rows = [];
+  for (const token of list) {
+    const m = String(token).match(/^([a-zA-Z0-9_]+)(?::(\d+))?$/);
+    if (!m) { rows.push({ item: String(token), ok: false, why: '名字不合法' }); continue; }
+    const name = m[1].toLowerCase();
+    const count = Math.max(1, parseInt(m[2] || '1', 10) || 1);
+    if (!planner.hasRecipe(name) && !((stock[name] || 0) > 0) && !itemDefOf(name)) {
+      rows.push({ item: name, count, ok: false, why: '没这东西', missing: [] });
+      continue;
+    }
+    const r = planner.plan(name, count, stock);
+    let missing = (r.missing || [])
+      .map((x) => ({ name: x.name, lack: Math.max(0, (x.need || 0) - (x.have || 0)) }))
+      .filter((x) => x.lack > 0);
+    // 规划器会把每条失败路径都记一遍（铁锭能走矿/粗铁/铁粒…），岔口太多：
+    // 只留「没有配方的真原料」，再按缺口从小到大留 3 条给模型看，别拿一坨中间产物糊人
+    if (missing.length) {
+      const raw = missing.filter((x) => x.name === '燃料' || !planner.hasRecipe(x.name));
+      if (raw.length) missing = raw;
+      missing.sort((x, y) => x.lack - y.lack);
+      missing = missing.slice(0, 3);
+    }
+    rows.push({
+      item: name, count, ok: !!r.ok, steps: (r.steps || []).length,
+      have: { inv: inv[name] || 0, chest: chest[name] || 0 },
+      missing,
+    });
+  }
+  const parts = rows.map((r) => {
+    if (r.why) return `${r.item}（${r.why}）`;
+    if (r.ok) return `${r.item}：材料够（${r.steps} 步能做完）`;
+    const lack = (r.missing || []).map((x) => `${x.name}差${x.lack}`).join(' 或 ') || '配方算不出来';
+    return `${r.item}：还缺 ${lack}`;
+  });
+  const age = useChest ? chestStockAge() : null;
+  const tail = useChest ? (age === null ? '（箱子还没清点过，只算背包）' : `（箱子按 ${age} 分钟前的记录）`) : '';
+  return { ok: rows.every((r) => !r.why), msg: parts.join('｜') + tail, extra: { rows, chestUsed: useChest, chestAgeMin: age } };
 });
 
 actRegister('give', async (a) => {

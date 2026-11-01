@@ -44,6 +44,10 @@ Thumbs.db
 # ==== 推送 token（绝对别上传）====
 .gh_token
 chests.json
+waypoints.json
+goal.json
+goal_log.jsonl
+chest_stock.json
 pvp_watch.log
 
 # ==== 本地推送工具（与项目无关，不进仓库）====

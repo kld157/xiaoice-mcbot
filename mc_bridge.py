@@ -159,6 +159,25 @@ TOOLS = [
             "item": {"type": "string", "description": "英文 id，如 wooden_sword"},
             "count": {"type": "number"}}, "required": ["item"]}}},
     {"type": "function", "function": {
+        "name": "waypoint", "description": "空间记忆（路标）。op=set 把当前位置记成路标（给 name，可带 note）；list 列全部路标和距离；del 删一个；go 直接走过去；show 查一个。以后「回家」「回水塘」就 waypoint op:go name:home，别再瞎扫坐标。",
+        "parameters": {"type": "object", "properties": {
+            "op": {"type": "string", "description": "set / list / del / go / show，默认 list"},
+            "name": {"type": "string", "description": "路标名，如 home、mine1、pond"},
+            "note": {"type": "string", "description": "备注，如「木头小屋」「露天水塘」"},
+            "x": {"type": "number", "description": "可选：不记当前位置，改记这个坐标"}, "y": {"type": "number"}, "z": {"type": "number"}}}}},
+    {"type": "function", "function": {
+        "name": "goal", "description": "跨轮目标：长任务先挂个目标，之后每轮 perceive 都会带在身上，聊两句也不会忘。op=set 设目标（可带 steps 步骤数组）；op=step 打勾一步；op=done 收尾；op=clear 放弃；默认 status 看进度。",
+        "parameters": {"type": "object", "properties": {
+            "op": {"type": "string", "description": "set / step / done / clear / status"},
+            "text": {"type": "string", "description": "目标描述，如「盖完木头小屋」"},
+            "steps": {"type": "array", "items": {"type": "string"}, "description": "步骤列表，可空"},
+            "step": {"type": "string", "description": "op=step 时指定哪一步（序号或关键词），空=下一步"}}}}},
+    {"type": "function", "function": {
+        "name": "need", "description": "算缺口：要做什么、还差多少材料（背包 + 箱子记录一起算，箱子是开过的存货快照）。支持 iron_pickaxe 或 \"iron_pickaxe:2,torch:16\"。",
+        "parameters": {"type": "object", "properties": {
+            "item": {"type": "string", "description": "物品英文 id，可带数量 item:count，多个用逗号"},
+            "chest": {"type": "boolean", "description": "false = 只算背包"}}}}},
+    {"type": "function", "function": {
         "name": "eat", "description": "吃点背包里的东西回复饱食度。",
         "parameters": {"type": "object", "properties": {}}}},
     {"type": "function", "function": {
@@ -177,7 +196,8 @@ TOOLS = [
             "count": {"type": "number"}, "secs": {"type": "number"}}}}},
 ]
 
-FAST_ACTIONS = {"perceive", "inventory", "build_status", "say", "stop", "jump", "build_house", "follow"}
+FAST_ACTIONS = {"perceive", "inventory", "build_status", "say", "stop", "jump", "build_house", "follow",
+                "waypoint", "goal", "need"}
 
 
 def log(msg):
@@ -400,6 +420,8 @@ def brief_result(name, res):
         return txt[:400]
     if name == "mobs":
         return str(res.get("msg") or "")[:300]
+    if name in ("waypoint", "goal", "need"):
+        return str(res.get("msg") or "")[:400]
     if name == "chest" and ex.get("items"):
         return (str(res.get("msg") or "")[:80] + " 内容：" +
                 json.dumps(ex["items"], ensure_ascii=False)[:300])

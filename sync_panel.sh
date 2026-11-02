@@ -33,6 +33,9 @@ ensure_clone() {
     [ -d "$PLUGIN_DIR" ] && mv "$PLUGIN_DIR" "${PLUGIN_DIR}.bak.$(date +%s)"
     git clone "$REPO_HTTPS" "$PLUGIN_DIR"
   fi
+  # 容器里通常没有全局 git 身份，缺了就用本仓库局部配置兜底
+  git -C "$PLUGIN_DIR" config user.name  >/dev/null 2>&1 || git -C "$PLUGIN_DIR" config user.name  "kld157"
+  git -C "$PLUGIN_DIR" config user.email >/dev/null 2>&1 || git -C "$PLUGIN_DIR" config user.email "kld157@users.noreply.github.com"
 }
 
 reload_hint() {
@@ -61,6 +64,15 @@ cmd_status() {
 cmd_pull() {
   ensure_clone
   cd "$PLUGIN_DIR"
+  if ! git fetch -q origin; then
+    warn "连不上 github.com（这条线路经常被卡），过会儿再试"
+    exit 1
+  fi
+  # 历史对不上但工作区内容其实和远端一致（比如改动是走 API 提交的），直接对齐，无损
+  if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ] && git diff --quiet origin/main -- .; then
+    git reset --hard -q origin/main
+    note "已与远端对齐：$(git log -1 --format='%h %s')"
+  fi
   if [ -n "$(git status --porcelain)" ]; then
     die "本地有未提交改动，先 --push 推上去，或手动 stash 后再拉"
   fi

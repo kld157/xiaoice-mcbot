@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.2 之后（仓库调整）
+
+- 插件不再准备独立仓库，源码挂进 `xiaoice-mcbot` 仓库的 `astrbot_plugin_mc_panel/` 子目录，与 bot 同仓维护。
+- README 安装说明改为「从 mcbot 目录拷贝」或「sparse checkout 只拉子目录」。
+
 ## v1.0.2
 
 性能与正确性收尾，为下一版上传做准备。
@@ -30,8 +35,3 @@
 ## v1.0.0
 
 - 初版。
-
-## v1.0.2 之后（仓库调整）
-
-- 插件不再准备独立仓库，源码挂进 `xiaoice-mcbot` 仓库的 `astrbot_plugin_mc_panel/` 子目录，与 bot 同仓维护。
-- README 安装说明改为「从 mcbot 目录拷贝」或「sparse checkout 只拉子目录」。

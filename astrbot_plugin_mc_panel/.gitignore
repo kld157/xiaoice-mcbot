@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-.DS_Store
-data/
-*.log
-_release_*.md

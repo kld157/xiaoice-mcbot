@@ -1,0 +1,11 @@
+{
+  "metadata": {
+    "display_name": "MC Companion Panel",
+    "short_desc": "Minecraft companion bot status, in-game chat and action log"
+  },
+  "views": {
+    "mc-panel": {
+      "title": "MC Companion Panel"
+    }
+  }
+}

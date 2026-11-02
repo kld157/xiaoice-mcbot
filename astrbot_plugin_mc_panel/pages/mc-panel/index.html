@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0d1411" />
+    <title>MC 陪玩面板</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="head">
+        <div class="logo">⛏</div>
+        <div class="title-wrap">
+          <h1>MC 陪玩面板 <span id="botName" style="color:#7e9c8c;font-size:12px"></span></h1>
+          <p id="serverLine">正在读取 mcbot 状态…</p>
+        </div>
+        <div class="head-right">
+          <span class="badge" id="stateBadge"><span class="dot"></span><span id="stateText">连接中</span></span>
+          <button id="refreshBtn" type="button">刷新</button>
+          <button id="autoBtn" type="button" class="primary">自动刷新：开</button>
+        </div>
+      </header>
+
+      <section class="cards">
+        <div class="card hp">
+          <div class="label">生命值 HP</div>
+          <div class="value" id="hpValue">-</div>
+          <div class="bar hp"><i id="hpBar"></i></div>
+          <div class="sub" id="hpSub">等待心跳</div>
+        </div>
+        <div class="card food">
+          <div class="label">饥饿度 FOOD</div>
+          <div class="value" id="foodValue">-</div>
+          <div class="bar food"><i id="foodBar"></i></div>
+          <div class="sub" id="foodSub">等待心跳</div>
+        </div>
+        <div class="card pos">
+          <div class="label">坐标 POSITION</div>
+          <div class="value small" id="posValue">-</div>
+          <div class="sub" id="posSub">世界坐标</div>
+        </div>
+        <div class="card ping">
+          <div class="label">延迟 PING</div>
+          <div class="value" id="pingValue">-</div>
+          <div class="sub" id="pingSub">毫秒</div>
+        </div>
+        <div class="card uptime">
+          <div class="label">在线时长 UPTIME</div>
+          <div class="value small" id="uptimeValue">-</div>
+          <div class="sub" id="uptimeSub">play.js 进程</div>
+        </div>
+        <div class="card">
+          <div class="label">聊天总量 MESSAGES</div>
+          <div class="value" id="chatTotal">-</div>
+          <div class="sub" id="chatSub">游戏内累计</div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <div class="panel-head">
+            <span class="dot-mark"></span>
+            <h2>游戏内聊天流</h2>
+            <span class="tag" id="chatTag">最近 60 条 · 含小冰回应</span>
+          </div>
+          <div class="chat-list" id="chatList">
+            <div class="empty">加载中…</div>
+          </div>
+        </div>
+
+        <div class="side">
+          <div class="panel">
+            <div class="panel-head">
+              <span class="dot-mark"></span>
+              <h2>最新动作</h2>
+              <span class="tag" id="actionTag">—</span>
+            </div>
+            <div class="list" id="actionList">
+              <div class="empty">还没有动作记录</div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <span class="dot-mark"></span>
+              <h2>最近下发</h2>
+              <span class="tag">cmd.txt</span>
+            </div>
+            <div class="list" id="cmdList">
+              <div class="empty">还没有下发过指令</div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <span class="dot-mark"></span>
+              <h2>运行配置</h2>
+              <span class="tag" id="cfgTag">mc.env / llm.json</span>
+            </div>
+            <div class="list" id="cfgList">
+              <div class="empty">加载中…</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="composer">
+        <div class="composer-row">
+          <input id="cmdInput" type="text" placeholder="给游戏里说句话…  或输入 ACT dig 下发动作" maxlength="500" />
+          <button class="primary" id="sendBtn" type="button">发送</button>
+        </div>
+        <div class="hint-line">
+          普通文字 = 游戏内聊天；<code>ACT dig|jump|pillar|wander|tp</code> = 动作指令。回车也能发～
+        </div>
+        <div class="toast" id="toast"></div>
+      </section>
+
+      <div class="foot">数据目录 <span id="dirLine">—</span> · 由 <span>小冰</span> 盯着 (￣▽￣)ノ</div>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

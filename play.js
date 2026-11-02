@@ -562,7 +562,7 @@ function handleChat(username, msg, internal) {
   lastActivity = Date.now();
 
   const intent = parseIntent(raw, mentioned);
-  const cmdLike = !!intent || /^(过来|come|跟我|跟着我|follow)|^(停|停下|stop|别动)|^(跳|jump)|^(位置|坐标|where|pos)|^(转圈|spin)|^(说|say)\s|^(挖|dig)|^(吃|eat)|^(背包|物品|inv)|^(帮助|help|指令|调试|debug|diag|测试|test)|(建|盖|造|搭).{0,6}(房|屋|窝|棚|家)|(填|堵|封|盖).{0,6}(井|坑|洞|水面|井口)|(游泳|潜水|下水|上岸|别游|浮上来)/.test(low) || /^(过来|停|跳|位置|转圈|挖|吃|背包|帮助|调试|测试)/.test(raw);
+  const cmdLike = !!intent || /^(过来|come|跟我|跟着我|follow)|^(停|停下|stop|别动)|^(跳|jump)|^(位置|坐标|where|pos)|^(转圈|spin)|^(说|say)\s|^(模拟|mock)\s|^(挖|dig)|^(吃|eat)|^(背包|物品|inv)|^(帮助|help|指令|调试|debug|diag|测试|test)|(建|盖|造|搭).{0,6}(房|屋|窝|棚|家)|(填|堵|封|盖).{0,6}(井|坑|洞|水面|井口)|(游泳|潜水|下水|上岸|别游|浮上来)/.test(low) || /^(过来|停|跳|位置|转圈|挖|吃|背包|帮助|调试|测试)/.test(raw);
   if (username === NAME) return;
   // 提到我但不是下指令 → 也交给真模型（更自然的搭话）
   if (mentioned && !cmdLike && bridgeAlive()) { log('CHAT@ ' + username + ': ' + raw); appendChat(username, raw); return; }

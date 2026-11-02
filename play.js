@@ -14,6 +14,8 @@ const fs = require('fs');
 const path = require('path');
 const { createPlanner } = require('./craft_engine.js');   // 合成规划器（纯逻辑，配方来自 minecraft-data）
 const LLM = require('./llm.js');                          // 模型调用层：说话用快的，干活用会思考的
+const PLAT = require('./platform.js');                    // 平台抽象层：锁、原子写、局域网端口发现
+const { tcpProbe } = require('./netprobe.js');            // 连服前先探端口，别对着空气狂重连
 
 // 连接参数一律走环境变量：真实值放同目录 mc.env（已被 .gitignore 忽略）
 const HOST = process.env.MC_HOST || '';
@@ -84,35 +86,19 @@ function logUsage(src, d) {
 }
 
 // —— 单实例锁：两个同账号 bot 会互相踢、还容易连环暴毙 ——
-const LOCK = path.join(__dirname, '.play.lock');
-// 判断锁里的 pid 是否“真是活着的 play.js”：僵尸/已退出/不是 play.js 都算死，避免假锁卡死
-function pidIsLivePlay(p) {
-  try {
-    const stat = fs.readFileSync('/proc/' + p + '/stat', 'utf8');
-    const state = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0];
-    if (state === 'Z' || state === 'X' || state === 'x') return false; // 僵尸：kill(pid,0) 仍会成功，必须排除
-    const cmd = fs.readFileSync('/proc/' + p + '/cmdline', 'utf8').split('\0').join(' ');
-    return cmd.indexOf('play.js') !== -1;
-  } catch (e) { return false; }
+// 实现挪进 platform.js：Linux 读 /proc 判死活（僵尸另算），Windows 问 tasklist，锁用 'wx' 原子创建
+// MC_LOCK 可让离线自测用独立锁文件，别和生产实例抢（测试脚本里设）
+const LOCK = process.env.MC_LOCK || path.join(__dirname, '.play.lock');
+const lockRes = PLAT.acquireLock(LOCK, 'play.js', (m) => log(m));
+if (!lockRes.ok) {
+  log(`另一个 play.js 还在跑(pid ${lockRes.pid})，本进程退出`);
+  process.exit(0);
 }
-try {
-  const old = parseInt(fs.readFileSync(LOCK, 'utf8').trim(), 10);
-  if (old && old !== process.pid) {
-    if (pidIsLivePlay(old)) {
-      log(`另一个 play.js 还在跑(pid ${old})，本进程退出`);
-      process.exit(0);
-    } else {
-      log(`锁定的是死进程(pid ${old})，清掉假锁继续启动`);
-    }
-  }
-} catch (e) {}
-try { fs.writeFileSync(LOCK, String(process.pid)); } catch (e) {}
-function releaseLock() {
-  try { if (parseInt(fs.readFileSync(LOCK, 'utf8'), 10) === process.pid) fs.unlinkSync(LOCK); } catch (e) {}
-  try { if (fs.readFileSync(LOCK, 'utf8').trim() === String(process.pid)) fs.unlinkSync(LOCK); } catch (e) {}
-}
-process.on('exit', releaseLock);
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { releaseLock(); process.exit(0); });
+function releaseLock() { PLAT.releaseLock(LOCK); }
+// 只挂 exit 钩子：SIGTERM/SIGINT 交给文件末尾那套（先 bot.quit 落状态再 exit），这里抢信号会打断它
+PLAT.installExitHandlers(releaseLock, { signals: false });
+// 旧名保留，免得别处引用断掉
+const pidIsLivePlay = (p) => PLAT.pidLooksAlive(p, 'play.js');
 
 let bot = null;
 let registered = false, loggedIn = false, ready = false;
@@ -1218,7 +1204,7 @@ actRegister('mobs', async (a) => {
 
 function writeActResult(id, name, ok, msg, extra) {
   const rec = { id: String(id), name, ok: !!ok, msg: String(msg || '').slice(0, 300), ts: Date.now(), extra: extra || null };
-  try { fs.writeFileSync(ACT_OUT, JSON.stringify(rec), 'utf8'); } catch (e) {}
+  try { PLAT.writeJsonAtomic(ACT_OUT, rec, { space: 0 }); } catch (e) {}
   log('ACT OUT ' + JSON.stringify(rec).slice(0, 400));
 }
 
@@ -3317,6 +3303,51 @@ setInterval(() => {
   }
 }, 150);
 
+// —— 重连节奏：指数退避 + 待机探测 ——
+// 旧逻辑固定 8 秒重试：服务器一挂就是每 8 秒撞一次，play.log 已经攒了 3605 条无用重连。
+// 新逻辑：8s → 16s → 32s → 60s → 120s 封顶；每次重连前先探端口，
+//        探不通就进「待机」每 60s 探一次，探通了立刻连（待机期日志只打首条 + 每 30 分钟一条）。
+const RETRY_MIN = 8000;
+const RETRY_MAX = 120000;
+const RETRY_BAN = 600000;
+const STANDBY_MS = 60000;
+let retryDelay = RETRY_MIN;
+let retryFails = 0;
+let connecting = false;     // 防止探测与重连撞车，冒出两个 bot 实例
+let standbySince = 0;       // 进入待机的时间，0 = 不在待机
+let standbyLoggedAt = 0;
+
+/** 连上了就清零退避——别让昨天的失败影响今天的节奏 */
+function noteConnected() { retryDelay = RETRY_MIN; retryFails = 0; standbySince = 0; }
+
+async function tryConnect(reason) {
+  if (connecting) return;
+  connecting = true;
+  try {
+    const ok = await tcpProbe(HOST, PORT, 4000);
+    if (!ok) {
+      const now = Date.now();
+      if (!standbySince) {
+        standbySince = now;
+        standbyLoggedAt = now;
+        log(`STANDBY: ${HOST}:${PORT} 探不通，转入待机（每 ${STANDBY_MS / 1000}s 探一次，期间不建连接）`);
+      } else if (now - standbyLoggedAt > 30 * 60000) {
+        standbyLoggedAt = now;
+        log(`STANDBY: 还在等 ${HOST}:${PORT}，已待机 ${Math.round((now - standbySince) / 60000)} 分钟（累计 ${retryFails} 次失败）`);
+      }
+      setTimeout(() => tryConnect('standby'), STANDBY_MS);
+      return;
+    }
+    if (standbySince) {
+      log(`STANDBY: ${HOST}:${PORT} 通了，结束待机（待机 ${Math.round((Date.now() - standbySince) / 1000)}s）`);
+      standbySince = 0;
+    }
+    create();
+  } finally {
+    connecting = false;
+  }
+}
+
 function create() {
   registered = false; loggedIn = false; ready = false;
   log(`connecting ${HOST}:${PORT} as ${NAME} (${VER})`);
@@ -3330,7 +3361,37 @@ function create() {
   resetMovements();   // 新连接 → Movements 得跟着新 bot 重建
 
 
-  // —— 断流哨兵：官方 keepalive 超时是 120s，太晚了；45s 一个包都没收到就主动重连 ——
+  // —— 登录超时 + 断流哨兵 ——
+  // 两个都要：TCP 通了不代表活着。服务器过载/插件鉴权卡住时，握手能停在半路，
+  // 进程"活着"、日志一条不动、机器人永远进不来——比直接断开还难发现。
+  const connRef = bot;
+  let lastRx = Date.now();
+  try { connRef._client.on('packet', () => { lastRx = Date.now(); }); } catch (e) {}
+  // 统一出口：先按正常方式关，2s 内 end 没来（登录阶段 quit 常常不触发 end）就手动接手
+  const forceReconnect = (why, msg) => {
+    log(msg);
+    try { connRef.quit(why); } catch (e) {}
+    setTimeout(() => {
+      if (connRef !== bot) return;   // end 已经走完了，交给退避流程
+      const wait = retryDelay;
+      retryDelay = Math.min(RETRY_MAX, retryDelay * 2);
+      retryFails++;
+      log(`  （quit 没触发 end，兜底断开，${Math.round(wait / 1000)}s 后重连，第 ${retryFails} 次失败）`);
+      try { connRef.end(why); } catch (e) {}
+      try { connRef._client && connRef._client.end(); } catch (e) {}
+      setTimeout(() => tryConnect('force'), wait);
+    }, 2000);
+  };
+  const loginTimer = setTimeout(() => {
+    if (connRef !== bot || ready) return;
+    forceReconnect('login-timeout', 'LOGIN TIMEOUT: 连上 120s 还没进游戏，主动断开重连');
+  }, 120000);
+  // 进游戏后 45s 一个包都没收到 = 假在线（官方 keepalive 要 120s 才反应过来，太晚）
+  const streamTimer = setInterval(() => {
+    if (connRef !== bot || !ready) return;
+    const gap = Date.now() - lastRx;
+    if (gap > 45000) forceReconnect('stream-stall', `STREAM STALL: ${Math.round(gap / 1000)}s 没收到任何包，主动重连`);
+  }, 5000);
   // 掉落物生灭日志：只记身边的（远处玩家的掉落物不刷屏），用来诊断"这服掉落物活几秒"
   const itemSeen = new Map();
   bot.on('entitySpawn', (e) => {
@@ -3392,6 +3453,8 @@ function create() {
 
   bot.on('spawn', () => {
     lastKick = '';   // 成功进来了，清掉上一次的踢人记录
+    clearTimeout(loginTimer);   // 真进来了，登录超时就不用了
+    noteConnected();
     ready = true;
     const p = bot.entity.position;
     log(`spawn at ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)} dim=${bot.game.dimension} hp=${bot.health}`);
@@ -3519,12 +3582,24 @@ function create() {
   });
   bot.on('error', (e) => log('ERROR: ' + (e.message || e).toString().slice(0, 200)));
   bot.on('end', (reason) => {
+    // 兜底断开后旧连接可能隔几十秒才吐出 end —— 别拿它去重连、更别把新连接标成未就绪
+    if (connRef !== bot) { log('  （旧连接迟到的 end，忽略：' + String(reason) + '）'); return; }
     ready = false;
+    clearTimeout(loginTimer);
+    clearInterval(streamTimer);
     try { stopFollow(); } catch (e) {}
     // 被 ban 了就别疯狂敲门，歇十分钟再试（也免得被看成攻击服务器）
     const banned = /banned|whitelist/i.test(String(lastKick || ''));
-    const wait = banned ? 600000 : 8000;
-    log('END: ' + reason + ` — reconnecting in ${Math.round(wait / 1000)}s` + (banned ? '（被服务器 ban 了，等一等）' : ''));
+    // 其余情况指数退避：服务器真挂了就别每 8 秒撞一次（顺便把日志刷爆）
+    let wait;
+    if (banned) {
+      wait = RETRY_BAN;
+    } else {
+      wait = retryDelay;
+      retryDelay = Math.min(RETRY_MAX, retryDelay * 2);
+    }
+    retryFails++;
+    log('END: ' + reason + ` — ${Math.round(wait / 1000)}s 后重连（第 ${retryFails} 次失败）` + (banned ? '（被服务器 ban 了，等一等）' : ''));
     // 断线后 GC 一次，留个内存基线（正常应该掉到 100MB 左右）
     setTimeout(() => {
       try {
@@ -3532,7 +3607,7 @@ function create() {
         log(`MEM afterEnd heap=${Math.round(process.memoryUsage().heapUsed / 1048576)}MB`);
       } catch (e) {}
     }, 1500);
-    setTimeout(create, wait);
+    setTimeout(() => tryConnect('end'), wait);
   });
 
   // 防 AFK：静止 50 秒就轻跳一下
@@ -5270,7 +5345,7 @@ const JUNK_PRESET = ['red_mushroom', 'rotten_flesh', 'phantom_membrane', 'leaf_l
   'copper_chestplate', 'dark_oak_sapling', 'dirt'];
 const CHEST_FILE = path.join(__dirname, 'chests.json');
 function loadChests() { try { return JSON.parse(fs.readFileSync(CHEST_FILE, 'utf8')) || {}; } catch (e) { return {}; } }
-function saveChests(o) { try { fs.writeFileSync(CHEST_FILE, JSON.stringify(o, null, 2)); } catch (e) {} }
+function saveChests(o) { PLAT.writeJsonAtomic(CHEST_FILE, o, { space: 2 }); }
 function isContainerBlock(b) { return !!b && CONTAINER_NAMES.indexOf(b.name) >= 0; }
 function findChestBlock(r = 8) {
   try {
@@ -5418,10 +5493,8 @@ function readJsonFile(p, dflt) {
   try { const o = JSON.parse(fs.readFileSync(p, 'utf8')); return (o && typeof o === 'object') ? o : dflt; } catch (e) { return dflt; }
 }
 function writeJsonFile(p, o) {
-  try {
-    if (o === null) { try { fs.unlinkSync(p); } catch (e) {} return; }
-    fs.writeFileSync(p, JSON.stringify(o, null, 2));
-  } catch (e) { log('jsonWrite ' + p + ' ' + (e.message || e)); }
+  // 原子写（临时文件 + rename）：写到一半被 kill 也不会留下坏 JSON，下次启动照常能读
+  if (!PLAT.writeJsonAtomic(p, o, { space: 2 })) log('jsonWrite 失败 ' + p);
 }
 function normName(n) { return String(n || '').trim().toLowerCase().replace(/\s+/g, '_').slice(0, 24); }
 
@@ -6082,7 +6155,7 @@ setInterval(async () => {
   if (!stuckRef || p.distanceTo(stuckRef) > 0.6) { stuckRef = p.clone(); stuckSince = Date.now(); return; }
 }, 5000);
 
-create();
+tryConnect('boot');
 
 process.on('uncaughtException', (e) => log('UNCAUGHT: ' + (e.stack || e).toString().slice(0, 400)));
 process.on('unhandledRejection', (e) => log('UNHANDLED: ' + (e && (e.stack || e)).toString().slice(0, 400)));

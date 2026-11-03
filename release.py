@@ -8,6 +8,11 @@
   python3 release.py -t v0.4.0 --from v0.3.0   # 指定起点（默认自动取最近一个 tag）
   python3 release.py -t v0.4.0 --note-extra notes.md   # 追加一段自定义说明
 
+跨仓库发版（默认只认脚本所在目录这个仓库）:
+  python3 release.py --repo kld157/astrbot_plugin_mc_panel -t v1.0.4 --update --body-file body.md --name "..."
+  python3 release.py --dir /AstrBot/data/plugins/astrbot_plugin_mc_panel -t v1.0.4 ...  # 连 git log 也换仓库
+  --repo 接受 owner/repo、https 地址、git@github.com:owner/repo.git
+
 改写已发布的文案（不新建 tag，只 PATCH 已有 release）:
   python3 release.py -t v0.4.0 --update --body-file body.md --name "标题"
   python3 release.py -t v0.4.0 --update --body-file body.md --dry-run
@@ -38,6 +43,9 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 API = "https://api.github.com"
 
+# 当前操作的本地 git 仓库目录（--dir 可覆盖），默认脚本所在目录
+GD = HERE
+
 CATS = [
     ("新功能", {"feat", "feature", "add", "新增", "新功能"}),
     ("修复", {"fix", "bug", "bugfix", "hotfix", "修复"}),
@@ -59,7 +67,14 @@ def token():
 
 
 def sh(*args):
-    return subprocess.run(args, cwd=HERE, capture_output=True, text=True, check=True).stdout
+    return subprocess.run(args, cwd=GD, capture_output=True, text=True, check=True).stdout
+
+
+def norm_repo(s):
+    """接受 owner/repo、https URL、git@github.com:owner/repo.git，统一成 owner/repo。"""
+    s = s.strip()
+    m = re.search(r"github\.com[:/](.+?)(?:\.git)?/?$", s)
+    return m.group(1) if m else s.strip("/")
 
 
 def repo_slug():
@@ -147,11 +162,18 @@ def main():
     ap.add_argument("--body-file", default="", help="用这个文件当 release 正文（--update 时用）")
     ap.add_argument("--update", action="store_true",
                     help="只改已发布 release 的标题/正文，不新建 tag")
+    ap.add_argument("--repo", default="",
+                    help="目标仓库，如 owner/repo 或 GitHub 地址；默认取 --dir 仓库的 origin")
+    ap.add_argument("--dir", default="",
+                    help="本地 git 仓库目录，默认本脚本所在目录")
     ap.add_argument("--draft", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    repo = repo_slug()
+    global GD
+    if a.dir:
+        GD = os.path.abspath(os.path.expanduser(a.dir))
+    repo = norm_repo(a.repo) if a.repo else repo_slug()
 
     # ---- 只改文案模式：不建 tag，直接 PATCH 已有 release ----
     if a.update:

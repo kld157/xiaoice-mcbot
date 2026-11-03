@@ -4820,6 +4820,8 @@ const AUTO = {
   plan: null,              // 本轮计划
   last: null,              // 上轮结果
   rounds: 0,
+  failStreak: 0,           // 连着几轮整轮没干成（用来触发重新拆步骤）
+  goalRounds: 0,           // 为当前目标干过几轮
 };
 
 const AUTO_MENU_LIST = [
@@ -4853,6 +4855,7 @@ const AUTO_MENU_LIST = [
   ['trade', '找村民看交易菜单，想换就给 args: {index:第几笔, count:换几次}'],
   ['shoot', '用弓射箭，args: {target:"玩家名或怪名", count}，不给 target 就射最近的怪'],
   ['ride', '上附近的船/矿车/马，已经在车上就下来；背包有船可以 args {place:true} 自己放一艘下水'],
+  ['goal', '看/设/推进当前目标：args {op:"status|set|step|done|plan", text, step}（挂着目标时一般不用你手动推，每轮会自动往前拱）'],
 ];
 const AUTO_MENU = AUTO_MENU_LIST.map(([n, d]) => `- ${n}：${d}`).join('\n');
 const AUTO_SET = new Set(AUTO_MENU_LIST.map(([n]) => n));
@@ -4874,7 +4877,10 @@ const AUTO_SYS = '你在 Minecraft 服务器里玩，角色是"微软小冰"：�
   '8) 最近事故里有记录的坐标是危险区（水/悬崖），别主动往那些地方跑；不确定就换方向做别的事。\n' +
   '9) 看「上一轮干了啥」：如果没成，先琢磨失败原因再换做法，别原样重试同一动作；同一个动作连着失败两次就换目标。\n' +
   '10) 血量低于 8 或饱食度低于 6，这一轮只保命：eat / surface / 往安全处 goto，不挖矿不打架。\n' +
-  '11) 想要的东西背包里已经有（比如木头够多、有铁镐了），就别再重复收集，去做点新的事情。';
+  '11) 想要的东西背包里已经有（比如木头够多、有铁镐了），就别再重复收集，去做点新的事情。\n' +
+  '12) 「当前目标」不是 null 时，这一轮优先把它的「下一步」往前推，别自己另起一摊。把这一步真干成了，就在输出里加 "task": 步骤序号（从 1 数）和 "task_done": true；没干成就别写 task_done，写 false 也行。\n' +
+  '13) 目标还在但步骤是空的：别乱跑，只回 {"think":"...","steps":[{"action":"idle"}]}，同时用 "plan":["第一步","第二步"] 把目标拆成 3~8 步（每步一句话、动词开头、能验收）。\n' +
+  '14) 目标的所有步骤都干完了，在输出里加 "goal_done": true，这一轮只回一步 idle。';
 
 function scanAround(r = 5) {
   const out = {};
@@ -4910,6 +4916,7 @@ function autoCtxJson() {
     背包: inv,
     正在盖房: !!info.building,
     正在跟人: !!info.following,
+    当前目标: goalCtxForAuto(),
     上一轮干了啥: AUTO.last ? `${AUTO.last.action}：${AUTO.last.ok ? '成了' : '没成'}，${AUTO.last.msg}` : '还没干过',
     最近事故: (DANGER.spots || []).filter(s => Date.now() - s.t < 3600000)
       .map(s => `${s.why}@${Math.floor(s.x)},${Math.floor(s.y)},${Math.floor(s.z)}`).join('；') || '无',
@@ -4989,6 +4996,19 @@ async function autoRun() {
   AUTO.running = true;
   AUTO.lastAt = Date.now();
   try {
+    // 目标挂着但一步都没拆：这轮先拆步骤，别让她瞎跑一圈又忘事
+    const g0 = loadGoal();
+    if (g0 && !g0.steps.length) {
+      const sp = await autoSplitGoal(g0);
+      if (sp) {
+        AUTO.last = { action: 'goal.plan', ok: true, msg: `把「${g0.text}」拆成 ${sp.length} 步：${sp.join(' → ').slice(0, 120)}`, at: Date.now() };
+        log('AUTO> 拆好步骤了，下一轮开工');
+      } else {
+        AUTO.last = { action: 'goal.plan', ok: false, msg: '拆步骤没拆出来', at: Date.now() };
+      }
+      return;
+    }
+    if (loadGoal()) AUTO.goalRounds = (AUTO.goalRounds || 0) + 1;
     const d = await autoDecide();
     if (!d) return;
     const steps = autoSteps(d);
@@ -4999,6 +5019,8 @@ async function autoRun() {
     AUTO.plan = { steps: steps.map(x => x.action), i: 0, think: String(d.think || ''), until: Date.now() + AUTO.everyMs };
     const res = [];
     let fails = 0;
+    let failCnt = 0;
+    let doneAny = 0;
     for (let i = 0; i < steps.length; i++) {
       const st = steps[i];
       AUTO.plan.i = i;
@@ -5012,6 +5034,7 @@ async function autoRun() {
       try { r = (await ACTIONS[st.action](st.args, 'auto')) || {}; } finally { actBusy = false; }
       const ok = r.ok !== false;
       fails = ok ? 0 : fails + 1;
+      if (!ok) failCnt++; else if (st.action !== 'idle' && st.action !== 'say') doneAny++;
       res.push(`${st.action}:${ok ? 'ok' : 'fail'} ${String(r.msg || '').slice(0, 70)}`);
       log(`AUTO< [${i + 1}/${steps.length}] ${st.action} ${ok ? 'ok' : 'fail'}: ${String(r.msg || '').slice(0, 160)}`);
       if (fails >= 2) { res.push('连着失败，收手'); break; }
@@ -5019,6 +5042,48 @@ async function autoRun() {
     }
     AUTO.last = { action: steps.map(x => x.action).join('→').slice(0, 80), ok: true, msg: res.join('；').slice(0, 160), at: Date.now() };
     log('AUTO< 本轮结束 ' + res.join(' | ').slice(0, 260));
+
+    // ---- 目标推进：只有模型明说「这步干成了」才勾掉，别自作多情 ----
+    try {
+      const gNow = loadGoal();
+      if (gNow) {
+        const ti = parseInt(d.task, 10);
+        if (ti > 0 && d.task_done && failCnt === 0) {
+          const r = await ACTIONS.goal({ op: 'step', step: ti }, 'auto');
+          if (r && r.msg) log('AUTO> 目标推进 ' + r.msg);
+          if (r && r.ok && r.extra && r.extra.next === null) {
+            const gg = loadGoal();
+            if (gg) { closeGoal(gg, 'done'); log(`AUTO> 目标「${gg.text}」全干完了`); }
+          }
+        }
+        if (d.goal_done) {
+          const gg = loadGoal();
+          if (gg) { closeGoal(gg, 'done'); log(`AUTO> 目标「${gg.text}」按她的说法完成了`); }
+        }
+      }
+      // 目标没写步骤而模型给了 plan：直接采用，省一次请求
+      if (gNow && !gNow.steps.length && Array.isArray(d.plan)) {
+        const sp = d.plan.map((s) => String(s).trim()).filter(Boolean).slice(0, 12);
+        if (sp.length) {
+          saveGoal({ ...gNow, steps: sp, done: [], updated: Date.now() });
+          log(`AUTO> 收下她拆的 ${sp.length} 步：${sp.join(' → ')}`);
+        }
+      }
+    } catch (e) { log('AUTO goal 回写失败 ' + ((e && e.message) || e)); }
+
+    // ---- 连着两轮都没干成：别硬撞，重新拆一遍步骤 ----
+    // 只歇着/只说话的不算「干成」，也不算「干不成」，别拿这个去重拆目标
+    const hasReal = steps.some((s) => s.action !== 'idle' && s.action !== 'say');
+    if (hasReal && (failCnt >= 2 || doneAny === 0)) AUTO.failStreak = (AUTO.failStreak || 0) + 1;
+    else if (hasReal) AUTO.failStreak = 0;
+    if (AUTO.failStreak >= 2) {
+      AUTO.failStreak = 0;
+      const gFail = loadGoal();
+      if (gFail) {
+        const sp = await autoSplitGoal(gFail, { because: '连着两轮没干成，最后几步是：' + res.slice(-3).join('；') });
+        if (sp) log(`AUTO> 连着卡住，把「${gFail.text}」重新拆成 ${sp.length} 步`);
+      }
+    }
   } catch (e) {
     log('AUTO ERR ' + ((e && e.message) || e));
     AUTO.last = { action: '?', ok: false, msg: '想事情的时候出错了：' + ((e && e.message) || e), at: Date.now() };
@@ -5632,8 +5697,68 @@ function goalBrief() {
   return s;
 }
 function closeGoal(g, how) {
+  if (!g || !g.text) return;
+  AUTO.goalRounds = 0; AUTO.failStreak = 0;
   try { fs.appendFileSync(GOAL_LOG, JSON.stringify({ text: g.text, steps: g.steps, done: g.done, closed: how, closedAt: Date.now() }) + '\n'); } catch (e) {}
   saveGoal(null);
+}
+
+// ---- ③-b 给自主行动看的「当前目标」：她每轮都能看见自己干到哪了 ----
+function goalCtxForAuto() {
+  let g = null;
+  try { g = loadGoal(); } catch (e) { return null; }
+  if (!g) return null;
+  const nx = goalNext(g);
+  return {
+    text: g.text,
+    steps: g.steps,
+    done: g.done,
+    下一步: nx ? `${nx.idx + 1}. ${nx.text}` : '步骤都干完了，只差收尾',
+    已经干了几轮: AUTO.goalRounds || 0,
+  };
+}
+
+// ---- ③-c 自主拆解：目标只有一句话时，先拆成能验收的步骤，别一句一句瞎撞 ----
+const GOAL_SPLIT_SYS = '你在 Minecraft 里干活，现在把一个人物目标拆成能干的小步骤。\n' +
+  '输出要求：\n' +
+  '1) 只输出一个 JSON 对象：{"steps":["第一步","第二步"]}，不要代码块、不要解释、不要 think 字段。\n' +
+  '2) 3~8 步，每步一句话，动词开头，写看得见的结果（例："弄到 16 个原木"、"搭到 4 格高"），别写"规划一下"这种空话。\n' +
+  '3) 每步都得能用下面这些动作做出来：\n' + AUTO_MENU + '\n' +
+  '4) 按依赖顺序排：先弄材料再动手；危险或要过夜的放后面，并留一步保命/收尾。\n' +
+  '5) 一步干完要能验收（数量够不够、方块在不在），别写"继续探索"这种没法判定的。';
+
+async function autoSplitGoal(g, opts) {
+  if (!g) return null;
+  if (!LLM_CFG) { log('AUTO> 没配 LLM，拆不了步骤'); return null; }
+  const o = opts || {};
+  const lines = ['目标：' + g.text];
+  if (o.because) lines.push('上次卡住的原因：' + o.because);
+  if (Array.isArray(g.steps) && g.steps.length && Array.isArray(g.done) && g.done.length) {
+    const okd = g.done.map((i) => g.steps[i]).filter(Boolean);
+    if (okd.length) lines.push('之前已经干完的：' + okd.join('；') + '（别让她重复做）');
+  }
+  try { lines.push('当前状况：' + JSON.stringify(autoCtxJson())); } catch (e) {}
+  lines.push('把目标拆成步骤，只回 JSON。');
+  let r = null;
+  try {
+    r = await LLM.chat(LLM_CFG, 'auto', [
+      { role: 'system', content: GOAL_SPLIT_SYS },
+      { role: 'user', content: lines.join('\n') },
+    ]);
+  } catch (e) { log('AUTO> 拆步骤请求炸了：' + ((e && e.message) || e)); return null; }
+  if (!r || !r.ok) { log('AUTO> 拆步骤失败：' + ((r && r.err) || '?')); return null; }
+  logUsage('auto', r.d);
+  let obj = null;
+  try { obj = extractDecisionJson(r.text); } catch (e) {}
+  let steps = obj && obj.steps;
+  if (!Array.isArray(steps)) steps = [];
+  steps = steps
+    .map((s) => (typeof s === 'string' ? s : (s && (s.text || s.step || s.what)) || ''))
+    .map((s) => String(s).trim()).filter(Boolean).slice(0, 12);
+  if (!steps.length) { log('AUTO> 拆步骤没拿到东西：' + String((r && r.text) || '').slice(0, 160)); return null; }
+  const cur = loadGoal() || g;
+  saveGoal({ ...cur, steps, done: [], updated: Date.now(), replanned: (cur.replanned || 0) + (o.because ? 1 : 0) });
+  return steps;
 }
 
 actRegister('goal', async (a) => {
@@ -5647,7 +5772,14 @@ actRegister('goal', async (a) => {
     if (typeof steps === 'string') steps = steps.split(/[,，、;；\n]+/);
     steps = Array.isArray(steps) ? steps.map((s) => String(s).trim()).filter(Boolean).slice(0, 12) : [];
     saveGoal({ text, steps, done: [], created: Date.now(), updated: Date.now() });
+    AUTO.goalRounds = 0; AUTO.failStreak = 0;
     return { ok: true, msg: `记下了：${text}` + (steps.length ? `（${steps.length} 步：${steps.join(' → ')}）` : ''), extra: { text, steps } };
+  }
+  if (op === 'plan' || op === 'split' || op === 'auto') {
+    if (!g) return { ok: false, msg: '还没挂目标呢，先给我一句目标（比如「盖个石头小屋」）' };
+    const steps = await autoSplitGoal(g, { because: String((a && a.because) || '').slice(0, 120) || undefined });
+    if (!steps) return { ok: false, msg: '拆步骤没拆出来，可能模型那边抽风了，等会儿再试' };
+    return { ok: true, msg: `把「${g.text}」拆成 ${steps.length} 步：${steps.join(' → ')}`, extra: { text: g.text, steps } };
   }
   if (!g) return { ok: op === 'status' || op === 'list' || op === 'show', msg: '现在手上没挂目标（想挂就说：先把房子盖完）', extra: { goal: null } };
   if (op === 'step' || op === 'tick' || op === 'check') {
@@ -5802,10 +5934,27 @@ actRegister('autopilot', (a) => {
   const on = (a.on !== undefined) ? !!a.on : !AUTO.on;
   AUTO.on = on;
   if (on) { AUTO.lastAt = 0; } else { AUTO.plan = null; }
+  if (a && (a.replan || a.plan)) {
+    // 手动要求重拆：走异步，先回个话，拆好了写日志
+    const g = loadGoal();
+    if (g) autoSplitGoal(g, { because: '老板让重新拆一遍' }).then((sp) => {
+      if (sp) log(`AUTO> 手动重拆「${g.text}」→ ${sp.length} 步`);
+    }).catch(() => {});
+  }
+  const gNow = loadGoal();
+  const nx = gNow ? goalNext(gNow) : null;
+  const goalTxt = gNow
+    ? gNow.text + (gNow.steps.length ? `（${gNow.done.length}/${gNow.steps.length} 步` + (nx ? `，下一步：${nx.text}` : '，就差点收尾') + '）' : '（还没拆步骤，下轮我自己拆）')
+    : '手上没挂目标';
   return {
     ok: true,
-    msg: on ? `自主行动开着呢，每 ${Math.round(AUTO.everyMs / 60000)} 分钟我自己想一次` : '自主行动关了，等你说话',
-    extra: { on: AUTO.on, every_min: Math.round(AUTO.everyMs / 60000), rounds: AUTO.rounds, plan: AUTO.plan, last: AUTO.last, pause_until: AUTO.pauseUntil },
+    msg: (on ? `自主行动开着呢，每 ${Math.round(AUTO.everyMs / 60000)} 分钟我自己想一次` : '自主行动关了，等你说话') + `｜目标：${goalTxt}`,
+    extra: {
+      on: AUTO.on, every_min: Math.round(AUTO.everyMs / 60000), rounds: AUTO.rounds,
+      plan: AUTO.plan, last: AUTO.last, pause_until: AUTO.pauseUntil,
+      goal: goalBrief(), goal_steps: gNow ? gNow.steps : [], goal_done: gNow ? gNow.done : [],
+      goal_next: nx ? nx.text : null, fail_streak: AUTO.failStreak || 0,
+    },
   };
 });
 

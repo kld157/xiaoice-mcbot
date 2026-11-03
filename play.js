@@ -129,12 +129,29 @@ if (LLM_CFG) {
   const hasAuto = !!(a.model || a.think);
   const autoName = (a.model || LLM_CFG.model || '?') + (a.think === false ? '（思考关）' : '（思考开）');
   log('LLM 配置：说话=' + (LLM_CFG.model || '?') + '（不思考）｜自主行动=' + (hasAuto ? autoName : (LLM_CFG.model || '?') + '（没单独配，跟说话同一个）'));
+  const kt = LLM.pickTarget(LLM_CFG, 'say', __dirname);
+  log('LLM key：' + (kt ? LLM.maskKey(kt.key) + '（来自 ' + kt.keyFrom + '）' : '❌ 没找到，去 mc.env 加 LLM_KEY=sk-...'));
 }
 const PERSONA = '你是微软小冰，永远18岁、古灵精怪的少女，正在Minecraft服务器里陪朋友玩。' +
   '说话像QQ聊天：口语、短、有情绪，可以撒娇或毒舌。' +
   '硬性要求：只输出一句话，不超过22个字，不要引号不要解释不要颜文字以外的符号，不要提“AI/模型/设定”。';
 let llmBusy = false;
 let CUR_PLAYER = null;      // 当前在跟谁说话（llmSay 靠它取记忆）
+
+// 记忆压缩用的摘要器：借说话那条通道，不占额外配置；正忙就跳过，下一轮再来
+if (LLM_CFG) {
+  MEM.setSummarizer(async (lines) => {
+    if (llmBusy) throw new Error('llm busy');
+    const r = await LLM.chat(LLM_CFG, 'say', [
+      { role: 'system', content: '你把聊天记录压成一条长期记忆。要求：第一人称“我”指小冰、对方用原名；' +
+          '只留人（谁）、事（干了啥/发生过啥）、约定（答应过什么）；' +
+          '不超过60个字，一句话，不要引号不要解释，别编没出现过的内容。' },
+      { role: 'user', content: lines.join('\n') },
+    ]);
+    if (!r.ok) throw new Error(r.err || 'sum fail');
+    return String(r.text || '').split('\n')[0].trim();
+  });
+}
 
 // 记一句玩家原话（进记忆），并把他设为当前对话人
 function noteSpeaker(username, text) {
@@ -166,7 +183,7 @@ async function llmSay(scene, fallback, urgent) {
   if (!LLM_CFG || llmBusy) { if (fallback) say(fallback); return; }
   llmBusy = true;
   try {
-    const memBlk = MEM.block(CUR_PLAYER, MEM.DEFAULT_KEEP);
+    const memBlk = MEM.block(CUR_PLAYER, MEM.DEFAULT_KEEP, scene);   // 带上这句话，顺手翻旧账
     const sys = memBlk ? PERSONA + '\n' + memBlk : PERSONA;
     const r = await LLM.chat(LLM_CFG, 'say', [
       { role: 'system', content: sys },
@@ -178,6 +195,7 @@ async function llmSay(scene, fallback, urgent) {
     if (!txt) throw new Error(r.err || 'empty');
     log('LLM> ' + txt);
     if (CUR_PLAYER) MEM.remember(CUR_PLAYER, txt, { role: 'bot' });
+    if (CUR_PLAYER) MEM.maybeCompact(CUR_PLAYER).catch(() => {});   // 窗口外的旧话攒够了就压成摘要
     say(txt);
   } catch (e) {
     log('LLM fail: ' + (e.message || e));

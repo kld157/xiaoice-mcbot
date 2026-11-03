@@ -59,5 +59,8 @@ _scratch/
 mcbot_docs/
 cortico create.md
 cortico create.md.bak-*
+# 记忆（一天一个文件：mc_memory-YYYY-MM-DD.jsonl，日文件/老单文件一起挡）
 mc_memory.jsonl
 mc_memory.jsonl.*
+mc_memory-*.jsonl
+mc_memory*.tmp

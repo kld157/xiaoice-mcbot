@@ -59,3 +59,5 @@ _scratch/
 mcbot_docs/
 cortico create.md
 cortico create.md.bak-*
+mc_memory.jsonl
+mc_memory.jsonl.*

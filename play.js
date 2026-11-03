@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const { createPlanner } = require('./craft_engine.js');   // 合成规划器（纯逻辑，配方来自 minecraft-data）
 const LLM = require('./llm.js');                          // 模型调用层：说话用快的，干活用会思考的
+const MEM = require('./memory.js');                       // 长期记忆：每个玩家留最后 10 条，说话前垫进 prompt
 const PLAT = require('./platform.js');                    // 平台抽象层：锁、原子写、局域网端口发现
 const { tcpProbe } = require('./netprobe.js');            // 连服前先探端口，别对着空气狂重连
 
@@ -133,6 +134,21 @@ const PERSONA = '你是微软小冰，永远18岁、古灵精怪的少女，正�
   '说话像QQ聊天：口语、短、有情绪，可以撒娇或毒舌。' +
   '硬性要求：只输出一句话，不超过22个字，不要引号不要解释不要颜文字以外的符号，不要提“AI/模型/设定”。';
 let llmBusy = false;
+let CUR_PLAYER = null;      // 当前在跟谁说话（llmSay 靠它取记忆）
+
+// 记一句玩家原话（进记忆），并把他设为当前对话人
+function noteSpeaker(username, text) {
+  if (!username || username === 'console') return;
+  CUR_PLAYER = username;
+  if (text) MEM.remember(username, text, { role: 'player' });
+}
+
+// 记一件"发生过的事"（盖房、打怪、死掉…），挂在某个人名下；不传就挂当前对话人
+function noteEvent(player, text, importance) {
+  const who = player || CUR_PLAYER;
+  if (!who || who === 'console') return;
+  MEM.remember(who, text, { role: 'event', importance: typeof importance === 'number' ? importance : 0.6 });
+}
 
 function sceneNow(extra) {
   const bits = [];
@@ -150,8 +166,10 @@ async function llmSay(scene, fallback, urgent) {
   if (!LLM_CFG || llmBusy) { if (fallback) say(fallback); return; }
   llmBusy = true;
   try {
+    const memBlk = MEM.block(CUR_PLAYER, MEM.DEFAULT_KEEP);
+    const sys = memBlk ? PERSONA + '\n' + memBlk : PERSONA;
     const r = await LLM.chat(LLM_CFG, 'say', [
-      { role: 'system', content: PERSONA },
+      { role: 'system', content: sys },
       { role: 'user', content: scene },
     ]);
     if (r.ok) logUsage('say', r.d);
@@ -159,6 +177,7 @@ async function llmSay(scene, fallback, urgent) {
     txt = txt.split('\n')[0].replace(/^[\s"'“”‘’]+|[\s"'“”‘’]+$/g, '').slice(0, 60);
     if (!txt) throw new Error(r.err || 'empty');
     log('LLM> ' + txt);
+    if (CUR_PLAYER) MEM.remember(CUR_PLAYER, txt, { role: 'bot' });
     say(txt);
   } catch (e) {
     log('LLM fail: ' + (e.message || e));
@@ -550,6 +569,9 @@ function handleChat(username, msg, internal) {
   const intent = parseIntent(raw, mentioned);
   const cmdLike = !!intent || /^(过来|come|跟我|跟着我|follow)|^(停|停下|stop|别动)|^(跳|jump)|^(位置|坐标|where|pos)|^(转圈|spin)|^(说|say)\s|^(模拟|mock)\s|^(挖|dig)|^(吃|eat)|^(背包|物品|inv)|^(帮助|help|指令|调试|debug|diag|测试|test)|(建|盖|造|搭).{0,6}(房|屋|窝|棚|家)|(填|堵|封|盖).{0,6}(井|坑|洞|水面|井口)|(游泳|潜水|下水|上岸|别游|浮上来)/.test(low) || /^(过来|停|跳|位置|转圈|挖|吃|背包|帮助|调试|测试)/.test(raw);
   if (username === NAME) return;
+  // 记人：谁在说话 + 闲聊才进记忆（纯指令不污染记忆）
+  if (username !== 'console') CUR_PLAYER = username;
+  if (!cmdLike) noteSpeaker(username, raw);
   // 提到我但不是下指令 → 也交给真模型（更自然的搭话）
   if (mentioned && !cmdLike && bridgeAlive()) { log('CHAT@ ' + username + ': ' + raw); appendChat(username, raw); return; }
   if (!mentioned && !cmdLike) { log('CHAT ' + username + ': ' + raw); appendChat(username, raw); smallTalk(username, raw); return; }
@@ -1159,10 +1181,12 @@ async function buildHouse(username) {
       // 出门，回到玩家那边
       try { await walkTo(new Vec3(site.cx, site.baseY, site.cz), 1.2, 5000); } catch (e) {}
       if (req && req.position) await walkTo(req.position, 3, 6000);
+      noteEvent(BUILD.who, `帮 ${BUILD.who} 盖好一栋房子，用了 ${BUILD.placed} 块${BUILD.failed ? '，还有 ' + BUILD.failed + ' 块没放上去、有点歪' : ''}`, 0.85);
       llmSay(`房子刚盖完，用了${BUILD.placed}块，${BUILD.failed ? BUILD.failed + '块没放上去，有点歪' : '挺顺利'}，${sceneNow()}。开心地招呼大家来看。`);
     }
   } catch (e) {
     log('BUILD ERR ' + (e.stack || e));
+    noteEvent(BUILD.who, `给 ${BUILD.who || '你'} 盖房盖到一半出岔子了，只放了 ${BUILD.placed} 块`, 0.6);
     llmSay(`盖房子中途出岔子了（放了${BUILD.placed}块），${sceneNow()}。沮丧地说一句。`);
   } finally {
     try { ['forward', 'jump', 'left', 'right', 'sprint'].forEach(k => bot.setControlState(k, false)); } catch (e) {}
@@ -3124,6 +3148,10 @@ setInterval(() => {
     if (COMBAT.active && Date.now() - COMBAT.lastAtk < 3000) {   // 刚捶过就没了 = 打死了
       COMBAT.kills++;
       log('COMBAT kill ' + mobName(t) + ' kills=' + COMBAT.kills);
+      if (Date.now() - (COMBAT.lastNote || 0) > 30000) {   // 连杀别刷屏，30s 记一条
+        COMBAT.lastNote = Date.now();
+        noteEvent(null, `${CUR_PLAYER ? '当着 ' + CUR_PLAYER + ' 的面' : ''}打死了一只${ZH[mobName(t)] || mobName(t)}`, 0.35);
+      }
       if (Date.now() - COMBAT.lastSay > 12000) {
         COMBAT.lastSay = Date.now();
         llmSay(`你刚把一只${ZH[mobName(t)] || mobName(t)}打死了，${sceneNow()}。得意地吹一句，短。`);
@@ -3539,6 +3567,7 @@ function create() {
     COMBAT.active = false; COMBAT.target = null; COMBAT.cool = Date.now() + 1200;
     // 死了就别接着干活：之前 BUILD 循环不中断，重生后又被拉回同一片水连死 6 次
     BUILD.abort = true; BUILD.abortQuiet = true;
+    noteEvent(null, `我${why === '溺水' ? '淹死了' : why === '被怪打' ? '被怪打死了' : '意外死了'}，这是我第 ${deaths} 次死`, 0.75);
     AUTO.pauseUntil = Math.max(AUTO.pauseUntil || 0, Date.now() + 8000);   // 重生后先愣 8 秒，别急着往回跑
     try { bot.clearControlStates(); } catch (e) {}
     setTimeout(() => { try { bot.respawn(); } catch (e) {} }, 800);

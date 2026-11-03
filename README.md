@@ -85,10 +85,10 @@ sh install_mineflayer.sh   # 幂等：缺什么装什么，失败自动切换 np
 
 模型与连接信息均不进入版本库。
 
-`llm.json`：
+`llm.json`（只放地址和模型，**不放 key**）：
 
 ```json
-{ "base": "https://api.example.com/v1", "model": "your-model", "key": "sk-..." }
+{ "base": "https://api.example.com/v1", "model": "your-model", "keyEnv": "LLM_KEY" }
 ```
 
 `mc.env`：
@@ -98,7 +98,12 @@ MC_HOST=你的服务器地址
 MC_PORT=25565
 MC_NAME=bot名字
 MC_PW=登录密码
+LLM_KEY=sk-你的密钥
 ```
+
+> key 一律走环境变量：`llm.js` 依次找 `keyEnv` 指定的名字 → `LLM_KEY` → `DEEPSEEK_API_KEY` → `OPENAI_API_KEY`，
+> 都没有时会自动读同目录 `mc.env`（所以直接 `node play.js` 也能起，不必先 source）。
+> 想换服务商各自用一把 key，可以在 `llm.json` 的 `auto` 块里单独写 `"keyEnv": "另一个变量名"`。
 
 ### 3. 启动
 
@@ -107,6 +112,19 @@ sh start.sh            # 前台安全启动 / 重启 play.js
 sh watchdog.sh         # 或：单实例守护，异常退出自动拉起
 python3 mc_bridge.py   # 另一个进程，负责对话与决策
 ```
+
+**Windows 上**（v0.8.0 起不用装 Git Bash / WSL 了，装个 Node.js 18+ 就能跑）：
+
+```bat
+node launcher.js start       :: 重启 bot，等价 sh start.sh
+node launcher.js watchdog    :: 常驻守护，等价 sh watchdog.sh
+node launcher.js status      :: 看谁在跑、锁干不干净
+node launcher.js stop        :: 停 bot，顺带停守护（--bridge 连桥一起停）
+```
+
+`start.sh` / `watchdog.sh` 现在是调 `launcher.js` 的薄壳，老命令照旧可用；逻辑只有一份，
+不会再出现「守护重启出来的 bot 和手动启动的 bot 行为不一样」这种事。
+Windows 上守护建议放「任务计划程序」里开机启动 `node launcher.js watchdog`。
 
 ### 4. 配置项
 
@@ -121,6 +139,7 @@ python3 mc_bridge.py   # 另一个进程，负责对话与决策
 | `MC_AUTOHARVEST` | `1` | 建造时是否顺路采集材料 |
 | `MC_FORCE_SURVIVAL` | `1` | 上线若被切换为冒险模式，自动执行 `/gamemode survival` |
 | `MC_USAGE_KEEP_DAYS` | `90` | 用量账本保留天数（`<=0` 表示不清理） |
+| `LLM_KEY` | 必填 | 大模型 API key，写在 `mc.env`；`llm.json` 里不写明文 |
 
 > `mc.env`、`llm.json`、日志、用量账本均已列入 `.gitignore`，仓库中只保留占位值；
 > 缺失 `MC_HOST` 时脚本会直接报错退出。
@@ -246,8 +265,9 @@ mcscan.py             方块扫描封装（scan 动作的 Python 壳 + CLI + 容
 where.js              注册 / 登录并上报位置
 drift.js              registry 漂移检测（baseline / check）
 chunk_scan.js         区块 stateId 全量扫描，用于定位越界的 mod 方块
-start.sh              安全启动 / 重启（仅针对 node 运行的 play.js）
-watchdog.sh           单实例守护，异常退出自动拉起
+launcher.js           跨平台启动/守护（start｜stop｜status｜watchdog），Windows 也认
+start.sh              薄壳 → launcher.js start
+watchdog.sh           薄壳 → launcher.js watchdog
 install_mineflayer.sh 一键环境安装（幂等）
 _push_retry.sh        带重试推送：先 API，失败回退 git push
 skins/                皮肤生成与渲染脚本

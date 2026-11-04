@@ -15,6 +15,7 @@ const path = require('path');
 const { createPlanner } = require('./craft_engine.js');   // 合成规划器（纯逻辑，配方来自 minecraft-data）
 const LLM = require('./llm.js');                          // 模型调用层：说话用快的，干活用会思考的
 const MEM = require('./memory.js');                       // 长期记忆：每个玩家留最后 10 条，说话前垫进 prompt
+const IMP = require('./important.js');                    // 重要记忆：钉住层，永不压缩不删（人/事/物/关系）
 const PLAT = require('./platform.js');                    // 平台抽象层：锁、原子写、局域网端口发现
 const { tcpProbe } = require('./netprobe.js');            // 连服前先探端口，别对着空气狂重连
 
@@ -153,11 +154,35 @@ if (LLM_CFG) {
   });
 }
 
+// 重要记忆的提炼器：跟摘要共用一个通道，正忙就跳过（下一句再说，别把说话卡住）
+// 用 request 那条便宜模型；只让它吐 JSON，解析失败就当没抽到
+if (LLM_CFG) {
+  IMP.setDir(MEM.getDir());
+  IMP.setExtractor(async ({ player, text, sys }) => {
+    if (llmBusy) throw new Error('llm busy');
+    const r = await LLM.chat(LLM_CFG, 'say', [
+      { role: 'system', content: sys },
+      { role: 'user', content: `玩家名：${player || '?'}\n他说：${text}` },
+    ]);
+    if (!r.ok) throw new Error(r.err || 'extract fail');
+    return String(r.text || '');
+  });
+}
+
+// 玩家明说「记住」的时候，跳过粗筛直接提炼（他说要记，就记）
+const FORCE_RE = /(记住|记一下|记一下这个|记牢|别忘|帮我记)/;
+
 // 记一句玩家原话（进记忆），并把他设为当前对话人
 function noteSpeaker(username, text) {
   if (!username || username === 'console') return;
   CUR_PLAYER = username;
   if (text) MEM.remember(username, text, { role: 'player' });
+  // 重要记忆：粗筛过了才提炼，明说「记住」就强制。不阻塞，抽完自己落盘
+  if (text && LLM_CFG) {
+    IMP.consider(username, text, FORCE_RE.test(text))
+      .then((got) => { if (got && (got.facts || got.relations)) log(`重要记忆 +${got.facts}事实 +${got.relations}关系`); })
+      .catch(() => {});
+  }
 }
 
 // 记一件"发生过的事"（盖房、打怪、死掉…），挂在某个人名下；不传就挂当前对话人
@@ -183,8 +208,11 @@ async function llmSay(scene, fallback, urgent) {
   if (!LLM_CFG || llmBusy) { if (fallback) say(fallback); return; }
   llmBusy = true;
   try {
+    const impBlk = IMP.block(CUR_PLAYER);                             // 只垫「当前这个人」的记忆，绝不串人
     const memBlk = MEM.block(CUR_PLAYER, MEM.DEFAULT_KEEP, scene);   // 带上这句话，顺手翻旧账
-    const sys = memBlk ? PERSONA + '\n' + memBlk : PERSONA;
+    const sys = impBlk
+      ? PERSONA + '\n' + impBlk + (memBlk ? '\n' + memBlk : '')
+      : (memBlk ? PERSONA + '\n' + memBlk : PERSONA);
     const r = await LLM.chat(LLM_CFG, 'say', [
       { role: 'system', content: sys },
       { role: 'user', content: scene },

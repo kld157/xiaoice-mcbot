@@ -64,3 +64,7 @@ mc_memory.jsonl
 mc_memory.jsonl.*
 mc_memory-*.jsonl
 mc_memory*.tmp
+# 重要记忆库（玩家档案，绝不入库）
+mc_important.json
+mc_important.json.*
+mc_important*.tmp

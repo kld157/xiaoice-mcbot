@@ -6,6 +6,8 @@
 //   node memcli.js fact 小明 家 杭州  手动记一条事实
 //   node memcli.js rel 小明 好友 服主  手动记一条关系（朋友/好友这类自动对称）
 //   node memcli.js forget 小明        删掉某个人的全部（或传 id 删单条）
+//   node memcli.js prune           扫一遍老存档，列出其中的现实信息（城市/住址/电话…）
+//   node memcli.js prune -y        同上，但真删（默认只列不动手）
 //   node memcli.js block            看看实际喂给模型的 prompt 长什么样
 //   node memcli.js test 我家在杭州     离线试一下提炼（不进库）
 //
@@ -13,6 +15,9 @@
 
 'use strict';
 const IMP = require('./important.js');
+// 调试用：换个数据目录跑（不动线上存档），比如
+//   MC_MEM_DIR=_scratch/prunetest node memcli.js prune
+if (process.env.MC_MEM_DIR) IMP.setDir(process.env.MC_MEM_DIR);
 
 const [, , cmd, ...args] = process.argv;
 
@@ -72,6 +77,20 @@ switch (cmd) {
     break;
   }
 
+  case 'prune': {
+    const yes = args.includes('-y') || args.includes('--yes');
+    const { hits, removed } = IMP.prunePrivate(!yes);
+    if (!hits.length) { console.log('干净，没有现实信息。'); break; }
+    console.log(yes ? '删掉这些：' : '这些是现实信息（加 -y 才真删）：');
+    for (const h of hits) {
+      const kind = h.kind === 'rel' ? '关系' : '事实';
+      console.log(`  · [${kind}] ${h.who} 的 ${h.what}：${h.value}` +
+        (h.old ? '（历史值）' : '') + `  [${fmtTs(h.ts)}]`);
+    }
+    console.log(yes ? `共删 ${removed} 处` : `共 ${hits.length} 处，未删除`);
+    break;
+  }
+
   case 'block':
     console.log(IMP.block(args[0]) || '（空，没什么可喂的）');
     break;
@@ -91,6 +110,7 @@ switch (cmd) {
   node memcli.js fact 小明 家 杭州    记一条事实
   node memcli.js rel 小明 好友 服主   记一条关系
   node memcli.js forget 小明          删掉某人的全部（或传 id）
+  node memcli.js prune [-y]           清理老存档里的现实信息（城市/住址等）
   node memcli.js block 小明           看喂给模型的 prompt（按人分开的）
   node memcli.js test 文本            离线验提炼/解析`);
 }

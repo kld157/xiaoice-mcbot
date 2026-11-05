@@ -170,7 +170,19 @@ function isSym(rel) { return SYM_REL.includes(String(rel || '')); }
 // 搬家了也覆盖不掉旧的。这里都折成同一个 attr，key 才对得上。
 const ATTR_ALIAS = {};
 function alias(canon, words) { for (const w of words) ATTR_ALIAS[w] = canon; }
-alias('家', ['住址', '住处', '住宅', '地址', '家在', '家在哪', '住的地方', '住哪', '老家']);
+alias('家', ['家在', '家在哪', '基地', '落脚点', '据点']);
+// 现实世界的地理信息一律不记（泄一句就可能被扒到真人），
+// 所以「住址 / 老家 / 城市」这些不归一、直接进黑名单扔掉。
+const PRIVATE_ATTR = ['住址', '住处', '住宅', '地址', '住的地方', '住哪', '住在', '老家', '城市',
+  '现实城市', '家乡', '籍贯', '学校', '公司', '单位', '工作单位', '手机', '手机号', '电话', '号码',
+  '微信', 'QQ号', '真实姓名', '姓名', '身份证', '银行卡', '邮箱'];
+// 值是现实地址的样子（「杭州市」「××小区」「××路 12 号」）也不收
+const PRIVATE_VAL = /(?:市|省|县|区|镇|乡|村|街道|路|街|巷|号|小区|公寓|大厦|号楼|单元|室)(?:$|[\s，,。]|\d)|^[\u4e00-\u9fa5]{2,4}(?:市|省|县|区)$/;
+
+function isPrivate(attr, value) {
+  if (PRIVATE_ATTR.includes(String(attr || ''))) return true;
+  return PRIVATE_VAL.test(String(value || ''));
+}
 alias('生日', ['出生日期', '生日日期', '哪天生日', '生日是哪天', '出生时间']);
 alias('年龄', ['岁数', '几岁', '年纪']);
 alias('喜欢', ['喜好', '爱好', '喜爱', '喜欢的东西', '最爱']);
@@ -204,6 +216,7 @@ function addFact(f) {
   if (!subject) return null;
   const value = scrubVal(clean(f.value, MAX_VALUE));
   if (!value) return null;
+  if (isPrivate(attr, value)) { log(`现实信息不收：${subject}.${attr}=${value}`); return null; }
 
   const key = (subject + '|' + attr).toLowerCase();
   const now = Number(f.ts) || Math.round(Date.now() / 1000);
@@ -303,6 +316,55 @@ function forget(sel) {
   return before - after;
 }
 
+// 老存档清扫：黑名单是后加的，之前存进去的现实信息（城市/住址/电话…）
+// 得挑出来删掉。只认「属性在黑名单」或「值是地址样式」，不动别的。
+// 「1-3 个汉字」当成名字放过，免得把「王路」这种 ID 当地址删了。
+function addrLike(v) {
+  const t = String(v || '').trim();
+  if (!t) return false;
+  if (/^[\u4e00-\u9fa5]{1,3}$/.test(t)) return false;
+  return PRIVATE_VAL.test(t);
+}
+
+function scanPrivate() {
+  const d = load();
+  const out = [];
+  for (const f of d.facts) {
+    if (isPrivate(f.attr, f.value)) {
+      out.push({ kind: 'fact', id: f.id, who: f.subject, what: f.attr, value: f.value, ts: f.ts });
+      continue;
+    }
+    const old = (f.prev || []).find(pv => isPrivate(f.attr, pv.value));
+    if (old) out.push({ kind: 'fact', id: f.id, who: f.subject, what: f.attr, value: old.value, ts: old.ts, old: true });
+  }
+  for (const r of d.relations) {
+    if (addrLike(r.b)) out.push({ kind: 'rel', id: r.id, who: r.a, what: r.rel, value: r.b, ts: r.ts });
+    else if (addrLike(r.note)) out.push({ kind: 'rel', id: r.id, who: r.a, what: r.rel, value: r.note, ts: r.ts, noteOnly: true });
+  }
+  return out;
+}
+
+// 真删。传 dry=true 只算不删。
+function prunePrivate(dry) {
+  const hits = scanPrivate();
+  if (dry || !hits.length) return { removed: 0, hits };
+  const badFact = new Set(hits.filter(h => h.kind === 'fact' && !h.old).map(h => h.id));
+  const prevFix = new Set(hits.filter(h => h.kind === 'fact').map(h => h.id));
+  const badRel = new Set(hits.filter(h => h.kind === 'rel' && !h.noteOnly).map(h => h.id));
+  const noteRel = new Set(hits.filter(h => h.noteOnly).map(h => h.id));
+  const d = load();
+  for (const f of d.facts) {
+    // 条目本身是地址就整条删；只是历史值脏，就只清历史值
+    if (!prevFix.has(f.id)) continue;
+    f.prev = (f.prev || []).filter(p => !isPrivate(f.attr, p.value));
+  }
+  d.facts = d.facts.filter(f => !badFact.has(f.id));
+  for (const r of d.relations) if (noteRel.has(r.id)) delete r.note;
+  d.relations = d.relations.filter(r => !badRel.has(r.id));
+  save();
+  return { removed: hits.length, hits };
+}
+
 function stats() {
   const d = load();
   const people = new Set();
@@ -384,9 +446,12 @@ const HINT = new RegExp([
 function looksImportant(t) { return HINT.test(String(t || '')); }
 
 const EXTRACT_SYS = '你从 Minecraft 聊天里抽「值得长期记住」的信息，只输出 JSON，不要解释。\n' +
-  '格式：{"facts":[{"subject":"小明","attr":"家","value":"杭州"}],"relations":[{"a":"小明","rel":"好友","b":"服主"}]}\n' +
+  '格式：{"facts":[{"subject":"小明","attr":"家","value":"主城东边红顶木屋 320,68,-112"}],"relations":[{"a":"小明","rel":"好友","b":"服主"}]}\n' +
   '规则：\n' +
-  '1. 只抽稳定的：身份、名字、住址、生日、口味喜好、习惯、长期约定、重要经过。\n' +
+  '1. 只抽稳定的：身份、名字、基地位置、生日、口味喜好、习惯、长期约定、重要经过。\n' +
+  '1b. 「家」一律指游戏里他自己的房子/基地——写位置、外观、坐标，比如「出生点北边河对岸的木屋 210,64,-88」。\n' +
+  '1c. 现实世界的个人信息一律不抽：城市、住址、学校、公司、电话、真实姓名、社交账号，' +
+  '哪怕他主动说、让你记住，也不抽不记。这类话当没听见。\n' +
   '2. 一次性的话、情绪、玩笑（除非明显是认真的约定）一律不抽。\n' +
   '3. relations 里「A是B的XX」就写成 a=A, rel=XX, b=B；rel 要短（2-4 字）。\n' +
   '4. 方向别搞反：rel 的含义是「a 是 b 的 rel」。「我叫他师父」= a=他, rel=师父, b=我；反过来写就错了。\n' +
@@ -479,6 +544,7 @@ module.exports = {
   setDir, getDir, setExtractor,
   load, save, block, stats,
   addFact, addRelation, listFacts, listRelations, forget,
+  isPrivate, scanPrivate, prunePrivate,
   extract, consider, applyExtracted, looksImportant, pickJson,
   isSym, scrubVal,
   FILE, BAK, MAX_FACTS, MAX_RELS, BLOCK_BUDGET, EXTRACT_SYS,

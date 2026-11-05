@@ -4869,7 +4869,8 @@ const AUTO_MENU_LIST = [
   ['eat', '吃点背包里的东西垫肚子'],
   ['mobs', '列附近实体/动物（找吃的、找怪都用它），args: {range:64}'],
   ['fish', '在附近水里钓鱼（需要钓竿，64 格内找水、会走过去；天黑不下钩），args: {casts:3, timeout:25000, force:false}'],
-  ['chest', '存/取/看箱子（清背包唯一有效的办法，toss 会被服务器回滚），args: {mode:"store|take|list", items:[...], preset:"junk", chest:"箱子名"}。给个新名字会自动新放一个箱子并记住坐标，比如 chest:"vault" 当保险箱'],
+  ['chest', '存/取/看箱子（清背包首选），args: {mode:"store|take|list", items:[...], preset:"junk", chest:"箱子名"}。给个新名字会自动新放一个箱子并记住坐标，比如 chest:"vault" 当保险箱；没有箱子时 store 会自动把垃圾就地扔地上（服务器很快就清掉）'],
+  ['toss', '把某样东西直接扔地上（清包兜底，没有箱子也能用；丢出去约 1 秒就被服务器清掉，不会回来），args: {item:"英文id", count}'],
   ['armor', '换上背包里最好的护甲'],
   ['craft', '搓东西（木板/木棍/工作台/工具武器都行），args: {item:"英文id", count}；没工作台会自己搓一张摆上'],
   ['attack', '打附近的怪（自动换武器/追击/跳劈），args: {count 最多几只(默认2), secs 最多打几秒(默认15)}'],
@@ -4927,10 +4928,15 @@ function scanAround(r = 5) {
 function autoCtxJson() {
   const info = (perceive() || {}).extra || {};
   let inv = '空';
+  let invUse = 0;
   try {
-    inv = (bot.inventory.items() || []).slice().sort((a, b) => b.count - a.count)
+    const its = bot.inventory.items() || [];
+    invUse = its.length;
+    inv = its.slice().sort((a, b) => b.count - a.count)
       .slice(0, 10).map(i => `${i.name}x${i.count}`).join(',') || '空';
   } catch (e) {}
+  const invTxt = inv === '空' ? '空'
+    : `${inv}（占用 ${invUse}/36${invUse >= 32 ? '，快满了：先 chest 存箱子，没箱子就 toss 扔垃圾' : ''}）`;
   let day = '不知道';
   try { day = bot.time.timeOfDay < 13000 ? '白天' : '晚上'; } catch (e) {}
   const players = (info.players || []).map(x => `${x.name}(距${x.dist})`).join('、') || '附近没人';
@@ -4941,7 +4947,7 @@ function autoCtxJson() {
     脚下: info.below, 脚底: info.feet,
     周围方块: scanAround(5),
     附近玩家: players,
-    背包: inv,
+    背包: invTxt,
     正在盖房: !!info.building,
     正在跟人: !!info.following,
     当前目标: goalCtxForAuto(),
@@ -5478,7 +5484,7 @@ actRegister('toss', async (a) => {
   }
 });
 
-// ---------- 容器存取：toss 被服务器回滚，清背包只能靠「存进箱子」 ----------
+// ---------- 容器存取：箱子优先，实在没有箱子就扔地上（实测服务器 ~1s 就清掉落物） ----------
 const CONTAINER_NAMES = ['chest', 'trapped_chest', 'barrel'];
 const JUNK_PRESET = ['red_mushroom', 'rotten_flesh', 'phantom_membrane', 'leaf_litter', 'gunpowder',
   'bone', 'string', 'arrow', 'lead', 'copper_leggings', 'copper_helmet', 'copper_boots',
@@ -5514,6 +5520,27 @@ async function placeItemAt(itemName, p) {
   }
   return false;
 }
+// 清背包兜底：把指定物品就地扔掉。扔的时候先关自动拾取，免得自己又捡回来
+async function tossNames(names) {
+  const moved = {};
+  const skipped = [];
+  const prevPick = AUTO_PICKUP;
+  AUTO_PICKUP = false;
+  try {
+    for (const nm of names) {
+      const stacks = bot.inventory.items().filter((i) => i.name === nm || i.name === 'minecraft:' + nm);
+      if (!stacks.length) { skipped.push(nm); continue; }
+      let n = 0;
+      for (const st of stacks) {
+        try { await bot.toss(st.type, null, st.count); n += st.count; } catch (e) { break; }
+        await bot.waitForTicks(4);
+      }
+      if (n) moved[nm] = n; else skipped.push(nm);
+    }
+    await bot.waitForTicks(6);
+  } finally { AUTO_PICKUP = prevPick; }
+  return { moved, skipped, invUsed: (bot.inventory.items() || []).length };
+}
 actRegister('chest', async (a) => {
   // 存/取/看箱子。mode: store(默认) | take | list    items:[...] 或 item:"x"
   if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };
@@ -5540,9 +5567,22 @@ actRegister('chest', async (a) => {
     block = findChestBlock(8);
   }
   let placedAt = null;
+  // 兜底：没有箱子就就地扔（这个服掉落物 ~1 秒被清，扔了就是真没了）
+  const tossFallback = async (why, note) => {
+    const t = await tossNames(names);
+    const pairs = Object.entries(t.moved).map(([k, v]) => k + 'x' + v);
+    return {
+      ok: true,
+      msg: `${note}${pairs.length ? '，就地扔掉了 ' + pairs.join(',') : (t.skipped.length ? '，背包里也没有可扔的' : '，也没东西好扔')}；背包现在占用 ${t.invUsed} 格`,
+      extra: { why: why + '_tossed', moved: t.moved, skipped: t.skipped, invUsed: t.invUsed, placedAt },
+    };
+  };
   if (!block && mode !== 'list') {
     const have = CONTAINER_NAMES.find((n) => invCountOf(n) > 0);
-    if (!have) return { ok: false, msg: '背包里没有箱子/木桶，没法开容器', extra: { why: 'no_container_item' } };
+    if (!have) {
+      if (!(a && a.fallbackToss === false)) return await tossFallback('no_container_item', '没箱子没木桶');
+      return { ok: false, msg: '背包里没有箱子/木桶，没法开容器', extra: { why: 'no_container_item' } };
+    }
     const spot = findFreePlaceSpot(bot.entity.position.floored().offset(1, 0, 0), 4) || findOpenStand(4);
     if (!spot) return { ok: false, msg: '附近找不到能放箱子的空地', extra: { why: 'no_spot' } };
     if (!nearEnough(spot)) await walkTo(spot, 2.8, 6000);
@@ -5555,6 +5595,7 @@ actRegister('chest', async (a) => {
     if (cname && isContainerBlock(block)) { reg[cname] = [spot.x, spot.y, spot.z]; saveChests(reg); }
   }
   if (!block) {
+    if (mode !== 'take' && !(a && a.fallbackToss === false)) return await tossFallback('no_chest', '附近没箱子');
     let msg;
     if (cname) {
       msg = stale

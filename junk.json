@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "items": [
+    "red_mushroom",
+    "rotten_flesh",
+    "phantom_membrane",
+    "leaf_litter",
+    "gunpowder",
+    "bone",
+    "string",
+    "arrow",
+    "lead",
+    "copper_leggings",
+    "copper_helmet",
+    "copper_boots",
+    "copper_chestplate",
+    "dark_oak_sapling",
+    "dirt"
+  ]
+}

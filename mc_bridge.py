@@ -145,13 +145,19 @@ TOOLS = [
             "required": ["match"]}}},
     {"type": "function", "function": {
         "name": "chest",
-        "description": "用箱子：mode=list 看箱子里有什么；store 存东西（items 数组或 preset:\"junk\" 存杂物）；take 取东西。给 chest:\"名字\" 指定箱子（vault 是保险箱），不认识的箱子名会自动放新的并记住。",
+        "description": "用箱子：mode=list 看箱子里有什么；store 存东西（items 数组或 preset:\"junk\" 存杂物）；take 取东西。给 chest:\"名字\" 指定箱子（vault 是保险箱），不认识的箱子名会自动放新的并记住。preset:\"junk\" 依赖杂物清单开关，默认关、清单可改（见 junk 工具）。",
         "parameters": {"type": "object", "properties": {
             "mode": {"type": "string", "description": "list / store / take，默认 store"},
             "items": {"type": "array", "items": {"type": "string"}, "description": "物品英文 id，可带数量如 \"dirt:32\"；给 all 或 preset 时可省"},
-            "preset": {"type": "string", "description": "\"junk\" = 存预设的杂物清单"},
+            "preset": {"type": "string", "description": "\"junk\" = 存预设的杂物清单（开关关着会直接拒绝，别硬塞）"},
             "chest": {"type": "string", "description": "箱子名，如 vault（只认登记过的名字）"},
             "x": {"type": "number", "description": "可选：直接用坐标打开（配合 scan 找出来的箱子）"}, "y": {"type": "number"}, "z": {"type": "number"}}}}},
+    {"type": "function", "function": {
+        "name": "junk",
+        "description": "杂物清单开关和内容管理（不同服的「垃圾」不一样，有服里这些东西反而是稀罕物）。op=list 看开关和清单；on/off 开关；add/remove 加减几种；set 整份替换；reset 恢复默认。store 用 preset:\"junk\" 之前先确认它开着。",
+        "parameters": {"type": "object", "properties": {
+            "op": {"type": "string", "description": "list(默认) / on / off / add / remove / set / reset"},
+            "items": {"type": "array", "items": {"type": "string"}, "description": "add/remove/set 用的物品英文 id 列表"}}}}},
     {"type": "function", "function": {
         "name": "craft",
         "description": "合成东西（木板/木棍/工作台/工具武器都行），没工作台会自己搓一张摆上。",

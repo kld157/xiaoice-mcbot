@@ -245,6 +245,7 @@ ACT {"id":"1","name":"goto","args":{"x":100,"y":64,"z":200}}
 | `dig` / `place` / `collect` / `surface` | 挖掉这块 / 放个方块 / 缺点土 / 爬出来 |
 | `scan` | 附近有箱子吗 / 有没有橡木（只读，坐标缺 y 也先扫） |
 | `chest` | 存点东西 / 把钻石拿出来 / 箱子里还有啥 |
+| `junk` | 杂物清单开不开 / 清单里加个 `dirt` / 这服这些东西很值钱，别再当垃圾了 |
 | `craft` / `eat` / `pickup` / `armor` | 做把木剑 / 吃点东西 / 捡一下 / 换上护甲 |
 | `waypoint` | 把这儿记成家 / 走去矿洞口 / 我记了几个路标（名字存 `waypoints.json`） |
 | `goal` | 先把房子盖完 / 下一步 / 这步完了 / 目标取消（多步目标存 `goal.json`）；挂着目标时自主行动会自动拆步骤、推进度、卡住了重拆 |
@@ -256,6 +257,24 @@ ACT {"id":"1","name":"goto","args":{"x":100,"y":64,"z":200}}
 
 `chest` 支持三种定位：已登记的名称（`chest:"west"`，坐标存于 `chests.json`）、
 未命名时取最近容器、或直接给出 `x/y/z`。未登记的名称不会被当作容器打开。
+
+### 杂物清单（`preset:"junk"` 的开关）
+
+不同服的「垃圾」完全不一样，同一个服里烂蘑菇可能遍地，另一个服里却是稀罕货，
+所以存杂物这件事必须能关、能改：
+
+```bash
+python3 runact.py '{"name":"junk","args":{"op":"list"}}'                       # 看开没开、清单有啥
+python3 runact.py '{"name":"junk","args":{"op":"off"}}'                        # 关掉（preset:"junk" 直接回绝）
+python3 runact.py '{"name":"junk","args":{"op":"add","items":["dirt"]}}'       # 往清单里加
+python3 runact.py '{"name":"junk","args":{"op":"remove","items":["diamond"]}}'
+python3 runact.py '{"name":"junk","args":{"op":"set","items":["dirt","cobblestone"]}}'
+python3 runact.py '{"name":"junk","args":{"op":"reset"}}'                      # 恢复默认清单
+```
+
+配置存在 `junk.json`：`{"enabled": bool, "items": [...]}`。代码里的默认是**关**（宁可少存不乱存），
+`chest` 在清单关着时收到 `preset:"junk"` 会直接回绝并提示，而不是照单抓药；
+`store` 没给 `items` 也不会再默默套用预设。想存具体东西始终可以直接 `items:[...]`。
 
 ### 方块扫描
 

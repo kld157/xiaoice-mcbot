@@ -40,7 +40,14 @@ USAGE_DIR = os.path.join(HERE, "mc_usage")      # token 记账，按天一个文
 USAGE = os.path.join(HERE, "mc_usage.jsonl")    # 旧账本（只读迁移用，新账不再写这里）
 USAGE_KEEP_DAYS = int(os.environ.get("MC_USAGE_KEEP_DAYS") or 90)   # 账本保留天数
 
-CONFIG = "/AstrBot/data/cmd_config.json"
+# 模型来源：自己的 llm.json + mc.env 优先，AstrBot 只当「装了就用」的备选。
+#   MC_LLM_SOURCE=auto（默认）：有 LLM_KEY 就用自己的，没有再去找 AstrBot 的配置
+#   MC_LLM_SOURCE=own        ：只用自己的，绝不读 AstrBot（不想装 AstrBot 的人用这个）
+#   MC_LLM_SOURCE=astrbot    ：只用 AstrBot 的配置（老行为）
+CONFIG = os.environ.get("MC_ASTRBOT_CONFIG") or "/AstrBot/data/cmd_config.json"
+LLM_SOURCE = (os.environ.get("MC_LLM_SOURCE") or "auto").strip().lower()
+LLM_CFG = os.path.join(HERE, "llm.json")
+ENV_FILE = os.path.join(HERE, "mc.env")
 
 POLL = 0.8                 # 秒
 MODEL_TIMEOUT = 20
@@ -375,7 +382,56 @@ def prune_usage(keep_days=None):
 
 
 # ---------------- 模型 ----------------
-def load_candidates():
+def _file_env():
+    """读 mc.env 里的 KEY=VALUE（和 llm.js 同一份约定）；进程环境变量优先。"""
+    out = {}
+    try:
+        with open(ENV_FILE, encoding="utf-8-sig") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                out[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return out
+
+
+def _pick(env, *names):
+    for n in names:
+        if not n:
+            continue
+        v = os.environ.get(n) or env.get(n)
+        if v and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def own_candidates():
+    """用自己的 llm.json + mc.env（LLM_KEY）组候选；没配 key 就返回空。"""
+    try:
+        with open(LLM_CFG, encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    env = _file_env()
+    key = _pick(env, cfg.get("keyEnv"), "LLM_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY")
+    if not key:
+        return []
+    base = _pick(env, "LLM_BASE", "LLM_API_BASE") or str(cfg.get("base") or "").strip()
+    model = _pick(env, "LLM_MODEL") or str(cfg.get("model") or "").strip() or "deepseek-chat"
+    if not base:
+        base = "https://api.deepseek.com/v1"
+    return [{
+        "api_base": base.rstrip("/"),
+        "api_key": key,
+        "model": model,
+        "pid": "own/" + model,
+    }]
+
+
+def astrbot_candidates():
     """从 AstrBot 配置里拿可用 provider；优先 deepseek/deepseek-chat（快）。"""
     with open(CONFIG, encoding="utf-8-sig") as f:
         cfg = json.load(f)
@@ -409,11 +465,28 @@ def load_candidates():
     return out
 
 
+def load_candidates():
+    """按 MC_LLM_SOURCE 决定模型来源：own（自己的配置）/ astrbot / auto（自己的优先，没配才找 AstrBot）。"""
+    own = own_candidates()
+    if LLM_SOURCE == "own":
+        return own
+    astr = []
+    if os.path.isfile(CONFIG):
+        try:
+            astr = astrbot_candidates()
+        except Exception as e:
+            log("读 AstrBot 配置失败（%s），改用自带配置" % str(e)[:60])
+    if LLM_SOURCE == "astrbot":
+        return astr or own
+    return own + astr
+
+
 def post_chat(msgs, tools=None, temp=0.95, max_tokens=200):
     """调一次模型，返回 (message_dict, pid)。带 tools 失败就退回纯文本。"""
     cands = load_candidates()
     if not cands:
-        raise RuntimeError("没有可用模型")
+        raise RuntimeError("没有可用模型：在 mc.env 里写 LLM_KEY（配 llm.json 用哪家），"
+                           "或者把 MC_LLM_SOURCE 设成 astrbot 并确保 %s 存在" % CONFIG)
     last = None
     for c in cands[:3]:
         payload = {

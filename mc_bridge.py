@@ -40,7 +40,7 @@ USAGE_DIR = os.path.join(HERE, "mc_usage")      # token 记账，按天一个文
 USAGE = os.path.join(HERE, "mc_usage.jsonl")    # 旧账本（只读迁移用，新账不再写这里）
 USAGE_KEEP_DAYS = int(os.environ.get("MC_USAGE_KEEP_DAYS") or 90)   # 账本保留天数
 
-# 模型来源：自己的 llm.json + mc.env 优先，AstrBot 只当「装了就用」的备选。
+# 模型来源：AstrBot 仅为可选的接入（MC_LLM_SOURCE，默认 auto）；自己的 llm.json + mc.env 优先。
 #   MC_LLM_SOURCE=auto（默认）：有 LLM_KEY 就用自己的，没有再去找 AstrBot 的配置
 #   MC_LLM_SOURCE=own        ：只用自己的，绝不读 AstrBot（不想装 AstrBot 的人用这个）
 #   MC_LLM_SOURCE=astrbot    ：只用 AstrBot 的配置（老行为）

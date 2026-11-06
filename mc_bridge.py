@@ -232,6 +232,20 @@ TOOLS = [
 FAST_ACTIONS = {"perceive", "inventory", "build_status", "say", "stop", "jump", "build_house", "follow",
                 "waypoint", "goal", "need"}
 
+# ---- 异步回报 ----
+# 长动作（dig/build_house/collect…）等不到回执时，不当作失败：
+# 把 id 记进 pending，主循环轮询 act_out.json，干完了再补一句话给玩家。
+ASYNC_TTL = 300.0          # 超过这么久还没回音就当它卡了
+ASYNC_CN = {
+    "dig": "挖", "collect": "收集", "build_house": "盖房子", "goto": "赶路", "follow": "跟过去",
+    "surface": "往上走", "scan": "扫了一圈", "fish": "钓鱼", "farm": "种地", "craft": "合成",
+    "attack": "打怪", "pvp": "对打", "eat": "吃东西", "drink": "喝东西", "chest": "翻箱子",
+    "sleep": "睡了一觉", "trade": "做买卖", "ride": "找载具", "toss": "扔东西", "place": "放方块",
+    "pickup": "捡东西", "armor": "穿装备", "junk": "整理背包", "give": "递东西", "need": "备料",
+    "waypoint": "记路标", "rescue": "去救人", "autopilot": "自动跑", "gravel_fill": "填坑",
+    "weapons": "换武器", "potions": "喝药水", "blueprint": "画图纸", "redstone": "摆红石",
+}
+
 
 def log(msg):
     line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
@@ -462,9 +476,12 @@ def brief_result(name, res):
             ("" if not ex else " " + json.dumps(ex, ensure_ascii=False)[:300]))
 
 
-def gen_reply(user, msg, history):
+def gen_reply(user, msg, history, notes=None, pending=None):
     """生成回复；模型可以调工具在游戏里干活。返回 (文本, pid, 动作记录)"""
     msgs = [{"role": "system", "content": PERSONA}]
+    if notes:
+        msgs.append({"role": "system", "content":
+                     "（你刚替他们干完的活儿，别重复干，随口提一句就行）\n- " + "\n- ".join(notes[-3:])})
     for h in history[-CTX_TURNS:]:
         msgs.append({"role": "user", "content": "%s: %s" % (h.get("user", "?"), h.get("msg", ""))})
         if h.get("reply"):
@@ -490,8 +507,9 @@ def gen_reply(user, msg, history):
                     args = {}
             except Exception:
                 args = {}
-            res = send_action(name, args)
-            brief = {"name": name, "args": args, "ok": res.get("ok"), "msg": res.get("msg")}
+            res = send_action(name, args, who=user, pending=pending)
+            brief = {"name": name, "args": args, "ok": res.get("ok"), "msg": res.get("msg"),
+                     "async": bool(res.get("async"))}
             actions.append(brief)
             log("TOOL %s %s -> %s %s" % (name, json.dumps(args, ensure_ascii=False),
                                          res.get("ok"), str(res.get("msg"))[:60]))
@@ -582,8 +600,12 @@ def write_cmd(text, wait=10.0):
     return write_raw("说 " + text, wait)
 
 
-def send_action(name, args=None, timeout=None):
-    """把动作发给 play.js，等它回执（act_out.json 里 id 对上）。"""
+def send_action(name, args=None, timeout=None, who=None, pending=None):
+    """把动作发给 play.js，等它回执（act_out.json 里 id 对上）。
+
+    pending: 传 state['pending'] 进来（dict）。等不到回执时会登记进去，
+    由 poll_async() 后续轮询 act_out.json，干完了补一句话 —— 这就是异步回报。
+    """
     args = args or {}
     if timeout is None:
         timeout = 8.0 if name in FAST_ACTIONS else 32.0
@@ -603,7 +625,101 @@ def send_action(name, args=None, timeout=None):
         except Exception:
             pass
         time.sleep(0.15)
+    # 命令确实送到游戏了，只是活儿没干完 → 挂起，等 dry 完再回报
+    if pending is not None:
+        pending[aid] = {"name": name, "args": args, "who": who or "?", "ts": time.time()}
+        log("ASYNC pending %s %s (等 %ss 未完成)" % (name, aid, int(timeout)))
+        return {"ok": True, "async": True, "msg": "活儿还没干完，先记着"}
     return {"ok": False, "msg": "动作超时没回信：%s" % name}
+
+
+def make_async_line(p, rec):
+    """把挂起动作的最终回执，压成一句像人说的话。"""
+    name = p.get("name") or "?"
+    if not rec.get("ok"):
+        return "唔，" + str(rec.get("msg") or "那个没弄成")[:60]
+    msg = str(rec.get("msg") or "").strip()
+    if name in ("scan", "mobs", "chest", "waypoint", "goal", "need"):
+        msg = brief_result(name, rec).strip()
+    cn = ASYNC_CN.get(name, name)
+    if len(msg) > 80:
+        msg = msg[:80].rstrip("，,、 ") + "…"
+    if not msg:
+        return "%s好啦～" % cn
+    # play.js 的 msg 本身就是句人话（"挖到 5 个…" / "停下了"），别再套一层主语
+    return ("搞定啦～" if len(msg) < 40 else "那个活儿完了～") + msg
+
+
+def poll_async(state):
+    """主循环里每轮调一次：看挂起的活儿干完没，干完就顺口报一声。"""
+    pending = state.get("pending") or {}
+    if not pending:
+        return 0
+    try:
+        with open(ACT_OUT, encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:
+        rec = None
+    now = time.time()
+    done = 0
+    for aid, p in list(pending.items()):
+        hit = rec if (rec and str(rec.get("id")) == str(aid)) else None
+        if hit is None:
+            if now - float(p.get("ts") or now) > ASYNC_TTL:
+                pending.pop(aid, None)
+                log("ASYNC expire %s %s" % (p.get("name"), aid))
+                line = "那个活儿（%s）没信儿了，多半卡住了…" % ASYNC_CN.get(p.get("name"), "干活")
+                speak_async(state, p.get("who") or "?", line)
+                done += 1
+            continue
+        pending.pop(aid, None)
+        line = clean(make_async_line(p, hit))
+        log("ASYNC done %s %s -> %s" % (p.get("name"), aid, line))
+        # 记一笔，下一轮对话里知道这活儿干完了
+        notes = state.setdefault("notes", {}).setdefault(p.get("who") or "?", [])
+        notes.append(line)
+        del notes[:-4]
+        speak_async(state, p.get("who") or "?", line)
+        done += 1
+    if len(pending) == 0 and state.get("pending"):
+        state["pending"] = pending
+    return done
+
+
+def speak_async(state, who, text):
+    """异步补话：直接写 cmd.txt 让 bot 说出口，并留个 note 给下一轮上下文。"""
+    text = clean(text or "")
+    if not text:
+        return False
+    if write_raw("说 " + text, wait=1.5):   # 短等待：通道忙就排队，别堵主循环
+        touch_hb()
+        log("ASYNC SAY %s: %s" % (who, text))
+        return True
+    # 通道被占（正常对话正在说）→ 下一轮再试
+    pend = state.setdefault("retry_say", [])
+    pend.append({"who": who, "text": text, "ts": time.time()})
+    del pend[:-5]
+    log("ASYNC SAY busy，排队稍后说：%s" % text[:40])
+    return False
+
+
+def flush_retry(state):
+    """把没抢到通道的补话，等通道空了再说出去。"""
+    q = state.get("retry_say") or []
+    if not q:
+        return 0
+    left, n, now = [], 0, time.time()
+    for it in q:
+        if now - float(it.get("ts") or 0) > 120:      # 超过两分钟就不说了，别翻旧账
+            continue
+        if write_raw("说 " + (it.get("text") or ""), wait=1.5):
+            touch_hb()
+            log("ASYNC SAY(retry) %s: %s" % (it.get("who"), (it.get("text") or "")[:40]))
+            n += 1
+        else:
+            left.append(it)
+    state["retry_say"] = left
+    return n
 
 
 def touch_hb():
@@ -630,8 +746,11 @@ def handle(items, state):
         now = time.time()
         if now - float(last.get(user) or 0) < PER_USER_GAP:
             continue
+        notes = (state.get("notes") or {}).pop(user, [])
         try:
-            reply, pid, acts = gen_reply(user, msg, hist_all.get(user, []))
+            reply, pid, acts = gen_reply(user, msg, hist_all.get(user, []),
+                                         notes=notes,
+                                         pending=state.setdefault("pending", {}))
         except Exception as e:
             log("FAIL %s <- %s | %s" % (user, msg[:40], e))
             continue
@@ -646,6 +765,8 @@ def handle(items, state):
                 reply = "开工啦～等我盖好喊你 ouo"
             elif bad and not oked:          # 全失败就别嘴硬，照实说
                 reply = ("没弄成…" + str(bad[0].get("msg") or "")[:40]).strip()
+            elif any(a.get("async") for a in acts):
+                reply = "好嘞，这个费点时间，弄完我喊你～"
             elif acts:
                 reply = "好嘞，马上弄！"
             else:
@@ -697,6 +818,9 @@ def main():
             # 空闲也保持心跳，play.js 才知道桥还活着
             if idle % 3 == 0:
                 touch_hb()
+        # 异步回报：活儿干完了就顺口说一声（跟新聊天同一线程，不会插话打架）
+        if poll_async(state) or flush_retry(state):
+            save_state(state)
         if once:
             break
         if state.get("usage_prune_day") != datetime.now().strftime("%Y-%m-%d"):

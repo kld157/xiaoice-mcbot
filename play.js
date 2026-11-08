@@ -17,6 +17,7 @@ const LLM = require('./llm.js');                          // 模型调用层：�
 const MEM = require('./memory.js');                       // 长期记忆：每个玩家留最后 10 条，说话前垫进 prompt
 const IMP = require('./important.js');                    // 重要记忆：钉住层，永不压缩不删（人/事/物/关系）
 const PLAT = require('./platform.js');                    // 平台抽象层：锁、原子写、局域网端口发现
+const MCIPC = require('./mc_ipc.js');                     // 与 AstrBot minecraft 适配器的本地 socket 通道（可选）
 const { tcpProbe } = require('./netprobe.js');            // 连服前先探端口，别对着空气狂重连
 
 // 连接参数一律走环境变量：真实值放同目录 mc.env（已被 .gitignore 忽略）
@@ -110,11 +111,98 @@ let lastGreet = 0;
 let deaths = 0;
 let lastSpokeAt = 0;   // 上一句话的时间，用来控话量
 
-function say(t) {
+var IPC = null;   // 用过再赋值，say() 里要判空
+
+// ===== 公屏聊天限速（配置化）=====
+// MC_CHAT_PER_MIN 每分钟最多说几句（0 = 关闭限速）
+// MC_CHAT_BURST   允许一口气说几句（突发额度）
+// MC_CHAT_QUEUE   超限后最多排队几句（0 = 直接丢）
+// MC_CHAT_MAXWAIT 排队最多等多久（毫秒），过时就不说了
+const CHAT = {
+  perMin: Math.max(0, parseInt(process.env.MC_CHAT_PER_MIN ?? '6', 10)),
+  burst: Math.max(1, parseInt(process.env.MC_CHAT_BURST || '3', 10)),
+  queueMax: Math.max(0, parseInt(process.env.MC_CHAT_QUEUE ?? '4', 10)),
+  maxWait: Math.max(0, parseInt(process.env.MC_CHAT_MAXWAIT || '8000', 10)),
+};
+const chatStat = { tokens: CHAT.burst, last: Date.now(), queue: [], sent: 0, dropped: 0, timer: null };
+
+function chatGapMs() { return CHAT.perMin > 0 ? 60000 / CHAT.perMin : 0; }
+
+function chatRefill() {
+  const now = Date.now();
+  const gap = chatGapMs();
+  if (gap > 0) chatStat.tokens = Math.min(CHAT.burst, chatStat.tokens + (now - chatStat.last) / gap);
+  chatStat.last = now;
+}
+
+// 真正的发送（不限速）
+function rawSay(t) {
   const m = String(t).slice(0, 240);
+  if (!bot || !bot.entity) { log('CHAT drop(未连接): ' + m.slice(0, 60)); return false; }
   log('SAY> ' + m);
   lastSpokeAt = Date.now();
+  chatStat.sent++;
   try { bot.chat(m); } catch (e) { log('sayErr:' + e.message); }
+  try { if (IPC) IPC.pushSelf(m); } catch (e) {}
+  return true;
+}
+
+function chatDrain() {
+  const now = Date.now();
+  chatRefill();
+  if (!chatStat.queue.length || !bot || !bot.entity) {
+    if (!chatStat.queue.length) { clearInterval(chatStat.timer); chatStat.timer = null; }
+    return;
+  }
+  while (chatStat.queue.length && chatStat.tokens >= 1) {
+    const it = chatStat.queue.shift();
+    if (now - it.t > CHAT.maxWait) { chatStat.dropped++; log('CHAT drop(排队超时): ' + it.m.slice(0, 60)); continue; }
+    chatStat.tokens -= 1;
+    rawSay(it.m);
+  }
+  // 剩下的过时条目清掉，别越积越多
+  chatStat.queue = chatStat.queue.filter((it) => {
+    if (now - it.t > CHAT.maxWait) { chatStat.dropped++; log('CHAT drop(排队超时): ' + it.m.slice(0, 60)); return false; }
+    return true;
+  });
+}
+
+function say(t) {
+  const m = String(t).slice(0, 240);
+  if (CHAT.perMin <= 0) return rawSay(m);          // 限速关了，老行为
+  chatRefill();
+  if (chatStat.tokens >= 1) { chatStat.tokens -= 1; return rawSay(m); }
+  if (chatStat.queue.length >= CHAT.queueMax) {
+    chatStat.dropped++;
+    log('CHAT drop(排队满): ' + m.slice(0, 60));
+    return false;
+  }
+  chatStat.queue.push({ m, t: Date.now() });
+  log(`CHAT queue(${chatStat.queue.length}) ${m.slice(0, 60)}`);
+  if (!chatStat.timer) chatStat.timer = setInterval(chatDrain, 300);
+  return true;
+}
+// ===== 聊天限速 END =====
+
+// ===== 本地 IPC：把公屏聊天实时推给 AstrBot 的 minecraft 适配器 =====
+// 开关 MC_NATIVE=0 可以整条关掉，退回「只有文件通道」的老路。
+function nativeAlive() {
+  try {
+    return !!(IPC && IPC.clientCount() > 0 && process.env.MC_NATIVE !== '0');
+  } catch (e) { return false; }
+}
+if (process.env.MC_NATIVE !== '0') {
+  try {
+    IPC = MCIPC.attach({
+      log,
+      onSay: (text) => { try { say(String(text).slice(0, 240)); } catch (e) {} },
+      sockPath: process.env.MC_IPC_SOCK || null,
+    });
+    IPC.start();
+  } catch (e) {
+    log('IPC 起不来（不影响主流程）: ' + (e.message || e));
+    IPC = null;
+  }
 }
 
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
@@ -386,6 +474,53 @@ function lookingAtMe(e, maxAngle = 0.9) {
   } catch (err) { return true; }
 }
 
+// 被拍时的“喊疼”限流：服里有玩家喜欢一直点你，6 秒一句重复台词很容易被当刷屏脚本
+const HIT_SAY_USER_CD = 30 * 1000;    // 同一玩家 30 秒内只喊一次
+const HIT_SAY_GLOBAL_CD = 20 * 1000;  // 不管谁拍，20 秒内最多喊一句
+const HIT_SAY_STREAK = 4;             // 同一个人连拍 4 次
+const HIT_SAY_HUSH = 90 * 1000;       // 就彻底安静 90 秒（真被打了也不喊）
+const hitSayStat = { last: 0, lastUser: '', userAt: {}, streak: 0, streakUser: '', hushUntil: 0 };
+
+function hitSay(username) {
+  const now = Date.now();
+  if (now < hitSayStat.hushUntil) {
+    log(`HIT@ ${username} 安静期内（还剩 ${Math.ceil((hitSayStat.hushUntil - now) / 1000)}s）→ 不说话`);
+    return false;
+  }
+  if (hitSayStat.streakUser === username) hitSayStat.streak++;
+  else { hitSayStat.streakUser = username; hitSayStat.streak = 1; }
+  if (hitSayStat.streak >= HIT_SAY_STREAK) {
+    hitSayStat.hushUntil = now + HIT_SAY_HUSH;
+    hitSayStat.streak = 0;
+    log(`HIT@ ${username} 连拍 ${HIT_SAY_STREAK} 次 → 闭嘴 ${HIT_SAY_HUSH / 1000}s（防刷屏）`);
+    return false;
+  }
+  const prevSame = hitSayStat.userAt[username] || 0;
+  if (prevSame && now - prevSame < HIT_SAY_USER_CD) {
+    log(`HIT@ ${username} ${Math.round((now - prevSame) / 1000)}s 前刚喊过 → 不重复`);
+    return false;
+  }
+  if (hitSayStat.last && now - hitSayStat.last < HIT_SAY_GLOBAL_CD) {
+    log(`HIT@ ${username} 全局冷却（${Math.round((now - hitSayStat.last) / 1000)}s 前刚说过）→ 不重复`);
+    return false;
+  }
+  hitSayStat.last = now;
+  hitSayStat.lastUser = username;
+  hitSayStat.userAt[username] = now;
+  say(Math.random() < 0.5 ? '哎哟！拍我干嘛～' : '唔…疼诶');
+  return true;
+}
+
+// 跟人走时的台词也走同一个节流，避免"拍了就跟、跟了就说"变成循环刷屏
+function sayThrottled(text) {
+  const now = Date.now();
+  if (now < hitSayStat.hushUntil) { log(`SAY(节流) 安静期中 → 吞掉: ${text}`); return false; }
+  if (hitSayStat.last && now - hitSayStat.last < HIT_SAY_GLOBAL_CD) { log(`SAY(节流) 全局冷却中 → 吞掉: ${text}`); return false; }
+  hitSayStat.last = now;
+  say(text);
+  return true;
+}
+
 // 只是"被拍了一下"：先记下来观察，不立刻跟
 function noteHit(username, why) {
   const now = Date.now();
@@ -399,8 +534,8 @@ function noteHit(username, why) {
   lastActivity = now;
   PENDING[username] = { t: now, dist, pos: p.position.clone(), why };
   log(`HIT@ ${username} (${why}) dist=${dist.toFixed(1)} -> 观察是否会走开`);
-  // 只是被打一下就"我懂了"太急了，先给个反应，等他走开再动
-  if (Math.random() < 0.6) say(Math.random() < 0.5 ? '哎哟！拍我干嘛～' : '唔…疼诶');
+  // 只是被打一下就"我懂了"太急了，先给个反应，等他走开再动（带限流，别刷屏）
+  if (Math.random() < 0.6) hitSay(username);
   return true;
 }
 
@@ -412,7 +547,7 @@ function triggerFollow(username, why) {
   if (!startFollow(FOLLOW_MS, username)) { log(`HIT@ ${username} (${why}) -> no target`); return false; }
   taskBegin(username, 'follow');
   log(`HIT@ ${username} (${why}) -> follow (确认走开)`);
-  say(already ? '又拍我又走，我不是一直跟着嘛～'
+  sayThrottled(already ? '又拍我又走，我不是一直跟着嘛～'
               : (Math.random() < 0.5 ? '哦～拍完就走，懂了懂了，马上跟上！'
                                      : '原来是想让我跟着你呀，来啦来啦～'));
   return true;
@@ -507,6 +642,7 @@ const CHAT_RULES = [
 const DEFAULT_REPLY = ['嗯嗯，我在听～', '然后呢然后呢？', '哈哈哈你说得对', '诶？真的吗', '这个我不太懂，但我觉得挺好的', '继续说呀，我听着呢', '有道理…大概'];
 
 function smallTalk(username, msg) {
+  if (nativeAlive()) return;               // 原生适配器在，交给 AstrBot 全管线回
   if (bridgeAlive()) return;               // 桥在，交给真模型回；本地规则只做兜底
   const now = Date.now();
   if (lastTalk[username] && now - lastTalk[username] < 2500) return; // 别刷屏
@@ -619,8 +755,8 @@ function handleChat(username, msg, internal) {
   if (username !== 'console') CUR_PLAYER = username;
   if (!cmdLike) noteSpeaker(username, raw);
   // 提到我但不是下指令 → 也交给真模型（更自然的搭话）
-  if (mentioned && !cmdLike && bridgeAlive()) { log('CHAT@ ' + username + ': ' + raw); appendChat(username, raw); return; }
-  if (!mentioned && !cmdLike) { log('CHAT ' + username + ': ' + raw); appendChat(username, raw); smallTalk(username, raw); return; }
+  if (mentioned && !cmdLike && (nativeAlive() || bridgeAlive())) { log('CHAT@ ' + username + ': ' + raw); appendChat(username, raw); return; }
+  if (!mentioned && !cmdLike) { log('CHAT ' + username + ': ' + raw); appendChat(username, raw); if (!nativeAlive()) smallTalk(username, raw); return; }
   if (username === NAME) return;
 
   const body = raw.replace(new RegExp(NAME, 'gi'), '').replace(/小冰/g, '').trim();
@@ -710,9 +846,17 @@ function handleChat(username, msg, internal) {
   } else if (/^(说|say)\s/i.test(body)) {
     say(body.replace(/^(说|say)\s+/i, '').slice(0, 180));
   } else if (/^(挖|dig)/i.test(body)) {
-    const bp = bot.blockAt(bot.entity.position.offset(0, -1, 0));
-    if (bp && bp.name !== 'bedrock') {
-      bot.dig(bp).then(() => say('挖到一块 ' + bp.name)).catch(e => say('挖不动…'));
+    const bp0 = bot.blockAt(bot.entity.position.offset(0, -1, 0));
+    if (bp0 && bp0.name !== 'bedrock') {
+      const bp = bp0;
+      (async () => {
+        await equipBestFor(bp);
+        try {
+          log(`DIG start ${bp.name}@${bp.position} digTime=${bot.digTime(bp)} canDig=${bot.canDigBlock(bp)} held=${bot.heldItem ? bot.heldItem.name : '空手'} feet=${bot.blockAt(bot.entity.position)?.name} onGround=${bot.entity.onGround} dbg=${JSON.stringify(bot.__digDebug ? bot.__digDebug(bp) : null)}`);
+        } catch (e) { log('DIG 诊断炸了 ' + (e && e.message)); }
+        setTimeout(() => { if (bot.targetDigBlock) log('DIG 5s 还没挖掉 ' + bot.targetDigBlock.position + ' face=' + bot.targetDigFace); }, 5000);
+        bot.dig(bp).then(() => say('挖到一块 ' + bp.name)).catch(e => { say('挖不动…'); log('DIG 失败 ' + bp.name + ' ' + (e && e.message) + (e && e.stack ? ' | ' + String(e.stack).split('\n').slice(1, 4).join(' <<') : '')); });
+      })();
     } else say('脚下是基岩，挖不了');
   } else if (/^(吃|eat)/i.test(body)) {
     const food = bot.inventory.items().find(i => /bread|cooked|apple|carrot|potato|beef|porkchop|mutton|chicken|fish|cookie|melon/.test(i.name));
@@ -1625,7 +1769,7 @@ actRegister('dig', async (a) => {
   if (b.position.distanceTo(bot.entity.position) > 4.5) {
     await walkTo(b.position, 2.6, 6000);
   }
-  try { await bot.dig(b); } catch (e) { return { ok: false, msg: '挖不动：' + (e.message || e) }; }
+  try { await equipBestFor(b); await bot.dig(b); } catch (e) { return { ok: false, msg: '挖不动：' + (e.message || e) }; }
   return { ok: true, msg: '挖掉一块 ' + b.name, extra: { block: b.name, mats: matCount() } };
 });
 // 给「目标格被占」找个替补：附近空格、脚下有靠着的东西（不然放上去会掉）
@@ -3246,6 +3390,22 @@ setInterval(() => {
   const hp = bot.health;
   const me = bot.entity.position;
   const dist = me.distanceTo(t.position);
+
+  // 贴脸砍了 12 秒目标血量一动不动（延迟服常见：位置不同步，挥刀全空）：别耗着，
+  // 按"够不着"收尾并记仇 30 秒，不然一只打不动的怪能把建房/挖矿永久卡住。
+  {
+    const thpNow = (t.health !== undefined ? t.health : 20);
+    if (COMBAT.hpId !== t.id || COMBAT.hpHp === undefined) {
+      COMBAT.hpId = t.id; COMBAT.hpHp = thpNow; COMBAT.hpAt = Date.now();
+    } else if (thpNow < COMBAT.hpHp - 0.01) {
+      COMBAT.hpHp = thpNow; COMBAT.hpAt = Date.now();
+    } else if (dist <= REACH + 0.4 && Date.now() - COMBAT.hpAt > 12000) {
+      log('COMBAT no-damage ' + n + ' 12s 血量没掉，先不跟它耗');
+      endCombat('unreachable');
+      return;
+    }
+  }
+
   const pvpCfg = isPvpTarget(t) ? PVP.cfg : null;   // PVP 档位：1 菜鸟 → 5 不留余力
 
   // 打不过的：躲
@@ -3422,6 +3582,90 @@ async function tryConnect(reason) {
   }
 }
 
+// ─── 兼容补丁：item.enchants 不是数组 ───
+// mineflayer 的 digging 插件把 heldItem.enchants 原样传给 prismarine-block，
+// 那边直接 for...of 迭代 → 抛 "enchantments is not iterable"，整次 dig 失败，
+// 表现就是每块都 "挖不动"、一块也挖不下来。
+// 1.21 新组件格式下 enchants 可能取到 undefined 或一个对象（不是数组），
+// 所以这里整个接管 bot.digTime：照着 digging 插件的算法重算一遍，只保证传下去的一定是数组。
+// 挖掘的所有路径最后都落到 bot.digTime。
+let MDATA = null;
+function patchDigCompat(b) {
+  if (!b || b.__digCompat) return;
+  // 内置插件要等 'inject_allowed' 才注入，太早调用时 digTime 还不存在，等下次时机再打
+  if (typeof b.digTime !== 'function') return;
+  const enchOf = (it) => { try { const e = it && it.enchants; return Array.isArray(e) ? e : []; } catch (e) { return []; } };
+  b.digTime = (block) => {
+    const held = b.heldItem;
+    let type = null, ench = [];
+    if (held) { type = held.type; ench = enchOf(held); }
+    let head = null;
+    try { head = b.inventory.slots[b.getEquipmentDestSlot('head')]; } catch (e) {}
+    const headEnch = enchOf(head);
+    if (headEnch.length) ench = ench.concat(headEnch);
+    const creative = b.game && b.game.gameMode === 'creative';
+    let inWater = false;
+    try {
+      const eye = b.entity.position.offset(0, b.entity.eyeHeight, 0);
+      inWater = ['water', 'flowing_water'].includes(b.blockAt(eye)?.name);
+    } catch (e) {}
+    const noGround = !(b.entity && b.entity.onGround);
+    const eff = (b.entity && b.entity.effects) || {};
+    // 自己按 vanilla 公式算一遍：prismarine 在这套数据上居然把石镐挖石头算成 13 秒，不能再信它
+    try {
+      if (!MDATA) MDATA = require('minecraft-data')(b.version || '1.21.11');
+      if (creative) return 0;
+      const mats = MDATA.materials && MDATA.materials[block.material];
+      let speed = 1;
+      if (type && mats && mats[type]) speed = mats[type];
+      const hard = block.hardness;
+      if (!(hard > 0)) return Infinity;
+      const mult = block.canHarvest(type) ? 30 : 100;
+      let delta = speed / hard / mult;
+      if (inWater) delta /= 5;
+      if (noGround) delta /= 5;
+      if (!(delta > 0)) return Infinity;
+      if (delta >= 1) return 0;
+      const ms = Math.ceil(1 / delta) * 50;
+      if (ms > 4000) log(`digTime 自算 ${block.name} speed=${speed} hard=${hard} mult=${mult} inWater=${inWater} noGround=${noGround} → ${ms}ms`);
+      return ms;
+    } catch (e) {
+      log('digTime 自算失败 ' + (e && e.message));
+    }
+    return block.digTime(type, !!creative, inWater, noGround, ench, eff);
+  };
+  // 诊断用：把 digTime 的每个输入都摊开，别只看到一个离谱的总数
+  b.__digDebug = (block) => {
+    const held = b.heldItem;
+    const type = held ? held.type : null;
+    let inWater = false;
+    try {
+      const eye = b.entity.position.offset(0, b.entity.eyeHeight, 0);
+      inWater = ['water', 'flowing_water'].includes(b.blockAt(eye)?.name);
+    } catch (e) {}
+    return {
+      name: block.name, hardness: block.hardness, material: block.material,
+      held: held ? held.name : null, canHarvest: type ? block.canHarvest(type) : null,
+      inWater, onGround: !!(b.entity && b.entity.onGround), digTime: b.digTime(block)
+    };
+  };
+  b.__digCompat = true;
+}
+
+// 挖之前先把最合适的工具换上：空手挖石头要 7.5 秒（服务端反作弊还容易判无效），换石镐只要 0.6 秒
+async function equipBestFor(block) {
+  try {
+    if (!bot || !bot.entity || !block) return;
+    const tool = bot.pathfinder && typeof bot.pathfinder.bestHarvestTool === 'function'
+      ? bot.pathfinder.bestHarvestTool(block)
+      : null;
+    if (!tool) return;
+    if (bot.heldItem && bot.heldItem.type === tool.type) return;
+    await bot.equip(tool, 'hand');
+    log('EQUIP ' + tool.name + ' → 挖 ' + block.name);
+  } catch (e) { log('EQUIP 失败 ' + (e && e.message || e)); }
+}
+
 function create() {
   registered = false; loggedIn = false; ready = false;
   log(`connecting ${HOST}:${PORT} as ${NAME} (${VER})`);
@@ -3433,6 +3677,14 @@ function create() {
 
   bot.loadPlugin(pathfinder);
   resetMovements();   // 新连接 → Movements 得跟着新 bot 重建
+
+  // 内置插件（含 digging 的 bot.digTime）要等 'inject_allowed' 才注入，
+  // 所以补丁挂在几个时机上，谁先到算谁；patchDigCompat 自己会防重复。
+  patchDigCompat(bot);
+  bot.once('inject_allowed', () => patchDigCompat(bot));
+  bot.once('login', () => patchDigCompat(bot));
+  bot.once('spawn', () => patchDigCompat(bot));
+
 
 
   // —— 登录超时 + 断流哨兵 ——
@@ -3530,6 +3782,7 @@ function create() {
     clearTimeout(loginTimer);   // 真进来了，登录超时就不用了
     noteConnected();
     ready = true;
+    try { if (IPC) IPC.setReady({ name: NAME, ver: VER, user: process.env.MC_USER || '' }); } catch (e) {}
     const p = bot.entity.position;
     log(`spawn at ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)} dim=${bot.game.dimension} hp=${bot.health}`);
     if (Date.now() - lastGreet > 90000) {   // 别每次 respawn 都刷屏
@@ -3567,6 +3820,7 @@ function create() {
   bot.on('chat', (username, message) => {
     log(`<${username}> ${message}`);
     if (username === NAME) return;
+    try { if (IPC) IPC.pushChat(username, message); } catch (e) {}
     handleChat(username, message);
   });
 
@@ -4569,7 +4823,7 @@ async function harvestBlocks(blockIds, countFn, targetCount, budgetMs, label) {
       } catch (e) {
         fails++;
         digBlock(target.v);
-        log(`HARVEST ${target.b.name} 失败：${e && e.message}`);
+        log(`HARVEST ${target.b.name} 失败：${e && e.message}${e && e.stack ? ' | ' + String(e.stack).split('\n').slice(1, 4).join(' <<') : ''}`);
         if (fails >= 3) { log('HARVEST 连着挖不动，先收手'); break; }
         await sleep(400);
       }
@@ -6488,4 +6742,4 @@ tryConnect('boot');
 
 process.on('uncaughtException', (e) => log('UNCAUGHT: ' + (e.stack || e).toString().slice(0, 400)));
 process.on('unhandledRejection', (e) => log('UNHANDLED: ' + (e && (e.stack || e)).toString().slice(0, 400)));
-process.on('SIGTERM', () => { log('SIGTERM, quitting'); try { bot.quit(); } catch (e) {} process.exit(0); });
+process.on('SIGTERM', () => { log('SIGTERM, quitting'); try { if (IPC) IPC.stop(); } catch (e) {} try { bot.quit(); } catch (e) {} process.exit(0); });

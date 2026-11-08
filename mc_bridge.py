@@ -552,7 +552,10 @@ def post_chat(msgs, tools=None, temp=0.95, max_tokens=200):
 def brief_result(name, res):
     """把回执压成一句话喂回模型（scan 之类一次几百个坐标会撑爆上下文）。"""
     if not res.get("ok"):
-        return "失败：" + str(res.get("msg") or "")[:120]
+        txt = "失败：" + str(res.get("msg") or "")[:120]
+        if res.get("note"):
+            txt += " " + str(res["note"])
+        return txt
     ex = res.get("extra") or {}
     if name == "scan":
         items = ex.get("list") or []
@@ -699,6 +702,13 @@ def write_cmd(text, wait=10.0):
     return write_raw("说 " + text, wait)
 
 
+# "没回信"和"干完了但啥也没有"是两码事。不写清楚模型就会演成"附近24格没扫到箱子"，
+# 谎话和实话在她嘴里长一个样 —— 所以回执里直接把这句塞给模型，不给它自由发挥的余地。
+NO_REPLY_NOTE = ("（这只是没收到回信，不是干完了、也不是扫过没东西；"
+                 "别把没发生的结果当成结论说出来，如实说没回信就行）")
+NO_SEND_NOTE = "（这条命令根本没送到游戏，什么都没发生，别当成做过了）"
+
+
 def send_action(name, args=None, timeout=None, who=None, pending=None):
     """把动作发给 play.js，等它回执（act_out.json 里 id 对上）。
 
@@ -721,7 +731,8 @@ def send_action(name, args=None, timeout=None, who=None, pending=None):
     aid = "%d" % (int(time.time() * 1000) % 10 ** 11)
     line = "ACT " + json.dumps({"id": aid, "name": name, "args": args}, ensure_ascii=False)
     if not write_raw(line, wait=min(10.0, timeout)):
-        return {"ok": False, "msg": "游戏那边命令通道忙着，没发出去"}
+        return {"ok": False, "msg": "游戏那边命令通道忙着，没发出去",
+                "note": NO_SEND_NOTE}
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -738,7 +749,7 @@ def send_action(name, args=None, timeout=None, who=None, pending=None):
         pending[aid] = {"name": name, "args": args, "who": who or "?", "ts": time.time()}
         log("ASYNC pending %s %s (等 %ss 未完成)" % (name, aid, int(timeout)))
         return {"ok": True, "async": True, "msg": "活儿已经派人去干了，别重复发，干完我说一声"}
-    return {"ok": False, "msg": "动作超时没回信：%s" % name}
+    return {"ok": False, "msg": "动作超时没回信：%s" % name, "note": NO_REPLY_NOTE}
 
 
 def make_async_line(p, rec):

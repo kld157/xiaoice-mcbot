@@ -1074,7 +1074,11 @@ async function postChat(msgs, tools, temp, maxTokens) {
 /** 把回执压成一句话喂回模型（scan 之类一次几百个坐标会撑爆上下文）。 */
 function briefResult(name, res) {
   res = res || {};
-  if (!res.ok) return '失败：' + String(res.msg || '').slice(0, 120);
+  if (!res.ok) {
+    let txt = '失败：' + String(res.msg || '').slice(0, 120);
+    if (res.note) txt += ' ' + String(res.note);
+    return txt;
+  }
   const ex = res.extra || {};
   if (name === 'scan') {
     const items = ex.list || [];
@@ -1240,6 +1244,12 @@ async function writeCmd(text, wait) {
  * pending: 传 state.pending 进来（对象）。等不到回执时会登记进去，
  * 由 pollAsync() 后续轮询 act_out.json，干完了补一句话 —— 这就是异步回报。
  */
+
+// "没回信"和"干完了但啥也没有"是两码事。不写清楚模型就会演成"附近24格没扫到箱子"，
+// 谎话和实话在她嘴里长一个样 —— 所以回执里直接把这句塞给模型，不给它自由发挥的余地。
+const NO_REPLY_NOTE = '（这只是没收到回信，不是干完了、也不是扫过没东西；别把没发生的结果当成结论说出来，如实说没回信就行）';
+const NO_SEND_NOTE = '（这条命令根本没送到游戏，什么都没发生，别当成做过了）';
+
 async function sendAction(name, args, timeout, who, pending) {
   args = args || {};
   // 同一件活儿已经在挂起队列里跑着 → 别再发一遍（真服务器上会白干两遍）
@@ -1266,7 +1276,7 @@ async function sendAction(name, args, timeout, who, pending) {
   const aid = String(Date.now() % 1e11);
   const line = 'ACT ' + JSON.stringify({ id: aid, name: name, args: args });
   if (!await writeRaw(line, Math.min(10000, timeout))) {
-    return { ok: false, msg: '游戏那边命令通道忙着，没发出去' };
+    return { ok: false, msg: '游戏那边命令通道忙着，没发出去', note: NO_SEND_NOTE };
   }
   const end = Date.now() + timeout;
   while (Date.now() < end) {
@@ -1283,7 +1293,7 @@ async function sendAction(name, args, timeout, who, pending) {
     log('ASYNC pending ' + name + ' ' + aid + ' (等 ' + Math.floor(timeout / 1000) + 's 未完成)');
     return { ok: true, async: true, msg: '活儿已经派人去干了，别重复发，干完我说一声' };
   }
-  return { ok: false, msg: '动作超时没回信：' + name };
+  return { ok: false, msg: '动作超时没回信：' + name, note: NO_REPLY_NOTE };
 }
 
 /** 把挂起动作的最终回执，压成一句像人说的话。 */

@@ -114,6 +114,16 @@ sh watchdog.sh         # 或：单实例守护，异常退出自动拉起
 python3 mc_bridge.py   # 另一个进程，负责对话与决策
 ```
 
+**不想装 Python？** 换成纯 Node 的桥，功能一样，单文件零依赖：
+
+```bash
+node mc_bridge.js --test "你好呀"   # 先试一句，不写 cmd.txt
+node mc_bridge.js                   # 常驻，跟 mc_bridge.py 干同样的活
+node mc_bridge.js --once            # 只处理一次积压就退出（调试用）
+```
+
+两个桥读同一套文件（`chat_in.jsonl` / `cmd.txt`），**只能跑一个**，同时开会双回复。
+
 **Windows 上**（v0.8.0 起不用装 Git Bash / WSL 了，装个 Node.js 18+ 就能跑）：
 
 ```bat
@@ -144,6 +154,9 @@ Windows 上守护建议放「任务计划程序」里开机启动 `node launcher
 | `MC_GC_TRIM` | 220MB | 达到该用量先执行一次 GC |
 | `MC_AUTOHARVEST` | `1` | 建造时是否顺路采集材料 |
 | `MC_FORCE_SURVIVAL` | `1` | 上线若被切换为冒险模式，自动执行 `/gamemode survival` |
+| `MC_CHAT_PER_MIN` | `6` | 公屏每分钟最多说几句（`0` = 关掉限速）；所有发言都走这一个出口，超出的先排队，排不下就丢 |
+| `MC_CHAT_BURST` | `3` | 允许一口气连着说几句（突发额度，不占每分钟名额） |
+| `MC_CHAT_QUEUE` / `MC_CHAT_MAXWAIT` | `4` / `8000` | 超速后最多排队几句 / 排队最多等多久（毫秒），过时的话就不说了 |
 | `MC_USAGE_KEEP_DAYS` | `90` | 用量账本保留天数（`<=0` 表示不清理） |
 | `LLM_KEY` | 必填 | 大模型 API key，写在 `mc.env`；`llm.json` 里不写明文 |
 | `MC_LLM_SOURCE` | `auto` | 模型从哪来：`own` 只用 `llm.json` + `mc.env`（不装 AstrBot 就用这个），`astrbot` 只用 AstrBot 的配置，`auto` 自己的优先、没配 key 才去找 AstrBot |
@@ -335,6 +348,8 @@ mcscan.register_chests(r=12, prefix='box')       # 登记容器，之后用 ches
 | --- | --- |
 | `play.js` | 机器人本体：连接与重连、物理、寻路、动作注册表、自主行动循环、内存看门狗、文件指令通道 |
 | `mc_bridge.py` | 模型桥接：读取新聊天 → 拼接上下文与人格 → 调用模型 → 写回指令。成功回复会更新 `.bridge_heartbeat`，`play.js` 据此关闭本地闲聊规则以避免双回复，心跳过期则自动回退 |
+| `mc_bridge.js` | 同一个桥的纯 Node 实现：零依赖单文件，只靠 `fetch` 调模型，行为与 `mc_bridge.py` 一致（同样的人格、记忆、工具、限速与用量记账）。没 Python 环境就用它 |
+| `mc_ipc.js` | `play.js` 与本机 AstrBot「minecraft」平台适配器之间的 socket 通道，`MC_IPC_SOCK` 没配就自动跳过 |
 | `craft_engine.js` | 纯逻辑合成规划器：输入「要什么 + 有什么」，输出合成顺序。配方取自 `minecraft-data`，熔炼表由调用方通过 `addRecipes()` 注入 |
 
 ### 目录结构
@@ -342,6 +357,8 @@ mcscan.register_chests(r=12, prefix='box')       # 登记容器，之后用 ches
 ```
 play.js               机器人主体（动作、自主行动、巡检、看门狗）
 mc_bridge.py          模型桥接（对话 / 决策 / 用量记账 / 每日清理）
+mc_bridge.js          同上，纯 Node 版（零依赖单文件，没 Python 也能跑）
+mc_ipc.js             play.js 与 AstrBot minecraft 适配器的 socket 通道（可选）
 craft_engine.js       通用合成规划器（测试：test_craft_engine.js）
 mcscan.py             方块扫描封装（scan 动作的 Python 壳 + CLI + 容器登记）
 memory.js             长期记忆流水（说话/事件留痕，检索后注入）
@@ -392,7 +409,7 @@ mc_usage/             用量账本（按天生成，运行时产物；供 AstrBo
 这时候需要管理员处理。
 
 **Q：它说的话是谁写的？能改性格吗？**
-由大模型生成，人格设定、聊天上下文、说话风格都在 `mc_bridge.py` 里，可以直接改。
+由大模型生成，人格设定、聊天上下文、说话风格都在桥里（`mc_bridge.py` 或 `mc_bridge.js`，两边一致），可以直接改。
 
 **Q：能用于 mod 服 / 别的版本吗？**
 默认面向 1.21.11 原版，`MC_VER` 可以改协议版本。带 mod 方块的服务器也能跑，

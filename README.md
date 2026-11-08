@@ -1,44 +1,50 @@
 <div align="center">
 
-<img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/banner.jpg" alt="小冰 Minecraft Bot —— 能聊天、能干活、能自己找事做的 Minecraft 常驻机器人" width="100%">
+<img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/banner.jpg" alt="小冰 Minecraft Bot —— 常驻服务器的 AI 玩家" width="100%">
 
 # 小冰 Minecraft Bot
 
-**一个常驻服务器的 Minecraft 陪玩机器人 —— 能聊天、能干活、也会自己找事做。**
+**一个常驻 Minecraft 服务器的 AI 玩家。** 会聊天、会干活，没人指挥也自己找事做。
 
-<sub>适配 Minecraft 1.21.11</sub>
+**小冰 v1.0.0** &middot; Minecraft 1.21.11 &middot; MIT
 
-[![Release](https://img.shields.io/github/v/release/kld157/xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/xiaoice-mcbot/releases)
 [![Stars](https://img.shields.io/github/stars/kld157/xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b&logo=github)](https://github.com/kld157/xiaoice-mcbot/stargazers)
+[![Forks](https://img.shields.io/github/forks/kld157/xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/xiaoice-mcbot/forks)
+[![Contributors](https://img.shields.io/github/contributors/kld157/xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/xiaoice-mcbot/graphs/contributors)
 [![Last Commit](https://img.shields.io/github/last-commit/kld157/xiaoice-mcbot?color=76bad9&style=flat-square&labelColor=46423b)](https://github.com/kld157/xiaoice-mcbot/commits)
 [![Node](https://img.shields.io/badge/node-18%2B-339933?style=flat-square&labelColor=46423b&logo=node.js&logoColor=white)](https://nodejs.org/)
 [![Minecraft](https://img.shields.io/badge/minecraft-1.21.11-62b47a?style=flat-square&labelColor=46423b)](https://www.minecraft.net/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square&labelColor=46423b)](LICENSE)
 
-<a href="#主要功能">主要功能</a> ｜
-<a href="#快速开始">快速开始</a> ｜
-<a href="#使用方式">使用方式</a> ｜
-<a href="#架构">架构</a> ｜
-<a href="#常见问题">常见问题</a> ｜
-<a href="#特别致谢">致谢</a> ｜
-<a href="#注意事项">注意事项</a>
+🚀 <a href="#安装--install">安装</a> &nbsp;|&nbsp;
+🎮 <a href="#用法--usage">用法</a> &nbsp;|&nbsp;
+🧭 <a href="#架构--architecture">架构</a> &nbsp;|&nbsp;
+❓ <a href="#问答--faq">问答</a> &nbsp;|&nbsp;
+💬 <a href="https://github.com/kld157/xiaoice-mcbot/issues">反馈</a>
 
 </div>
 
-## 简介
+## 简介 · INTRO
 
-本项目基于 [mineflayer](https://github.com/PrismarineJS/mineflayer) 实现一个长期在线的 Minecraft 机器人，
-并以大语言模型作为决策层：它可以参与聊天、跟随玩家、采集与建造、战斗，也能在无人指挥时自主安排行动。
+小冰是一个常驻 Minecraft 服务器的 AI 玩家。
 
-它的定位不是「脚本刷资源工具」，而是尽可能让一个角色自然地在服务器里长期存在，与玩家一起游玩。
+她不只是一个会聊天的机器人，也不只是一个能帮你挖矿盖房的"有用的助手"——她是服务器里那个一直在线、有自己节奏的人。她不追求把每件事做到最优，追求的是「有个人真的在」。
 
-- **不追求「更好」，追求「更像」**：项目组织与「最像而不是好」的设计取向参考了 [MaiBot](https://github.com/Mai-with-u/MaiBot)。
-  一个有用的助手会给出最优解，而一个同伴会先看看你人在哪、背包还够不够，再决定要不要帮忙。
-- **不写指令也能用**：玩家在游戏里正常说话，模型自己挑该调用的动作，不用背 `/` 命令表。
-- **没人理它的时候也在场**：默认每 5 分钟自己做一次决策（`MC_AUTO_MS=300000`），会走路、整理、查看四周，而不是站着假装在线。
-- **会失手，但说得清楚**：挖不动、放不下、材料不够、箱子没登记，都会用一句人话告诉你原因，而不是沉默或假装完成。
+- **说话就能用**：不用记 `/` 命令表。在聊天框里正常说话它就能懂，「过来」「帮我搭个屋」「附近有箱子吗」都行；模型自己挑动作去执行。
+- **没人指挥也不会站着**：默认每 5 分钟自主决策一次——下洞、整理箱子、修整住处，甚至到公屏上说两句。挂上 `goal` 会自己拆步骤，连着卡住就重新拆。
+- **会干活，也会失手**：走位、跟随、挖掘、放置、搭塔、建造、采集、合成、战斗、进食、换甲都支持；挖不动、材料不够、箱子没登记，它会用一句人话讲原因，不假装完成。
+- **不用装 Python，也不必接 AstrBot**：纯 Node 桥 `mc_bridge.js`，零依赖单文件；要接 AstrBot 再切 `MC_LLM_SOURCE`。
+- **能长期挂着**：自动重连、死亡重生、防 AFK、内存看门狗，掉线不用你管。
 
-## 效果展示
+它不以「更好用的刷资源工具」为目标，而是「更像一个住在服务器里的人」——这个取向参考了 [MaiBot](https://github.com/Mai-with-u/MaiBot)。
+
+## 效果展示 · SHOWCASE
+
+<!-- 动图位（优先补这一段：60 秒实录胜过十张截图）
+<img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/demo.gif" width="100%">
+
+- 🎬 **动图**：进服、有人随口说一句「帮我挖点铁」、它背着矿回来报备
+-->
 
 <!-- 截图位（把图放进 assets/ 后取消注释即可显示）
 <img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/demo-chat.png" width="49%"> <img src="https://cdn.jsdmirror.com/gh/kld157/xiaoice-mcbot@main/assets/demo-mining.png" width="49%">
@@ -51,7 +57,7 @@
 -->
 _截图陆续补充中。_
 
-## 主要功能
+## 主要功能 · FEATURES
 
 1. 💬 **自然语言交互**：玩家在游戏内直接说话即可，模型自行选择合适的工具执行，无需记忆指令格式。
 2. 🧱 **完整行动能力**：走位、跟随、挖掘、放置、搭塔、建造房屋、采集、拾取、合成、战斗、进食、更换护甲。
@@ -63,7 +69,7 @@ _截图陆续补充中。_
 7. 💰 **成本可控**：每次模型调用的用量按天记账（`mc_usage/YYYY-MM-DD.jsonl`），可配置保留天数自动清理；
    配合 AstrBot 的「余额」插件 `astrbot_plugin_token_meter`（**未公开**，见下节说明）即可查看每日花费、可撑天数与可聊轮数。
 
-## 快速开始
+## 安装 · INSTALL
 
 ### 环境要求
 
@@ -193,7 +199,7 @@ Windows 上守护建议放「任务计划程序」里开机启动 `node launcher
 > 不装这个插件，bot 照样正常跑，只是没有账单界面。账本依然按天写入，超过 `MC_USAGE_KEEP_DAYS` 会自动清理；
 > 想自己看数的话，它只是一行一个 JSON（含模型名、输入/输出 token、时间），随手 `jq`/几行 Python 就能按天汇总。
 
-## 使用方式
+## 用法 · USAGE
 
 ### 游戏内对话
 
@@ -338,7 +344,7 @@ mcscan.register_chests(r=12, prefix='box')       # 登记容器，之后用 ches
 
 扫描仅覆盖服务器已加载的区块。远处会返回偏高的 `unloaded` 计数，并附「一半以上区块没加载，走近点再扫」的提示。
 
-## 架构
+## 架构 · ARCHITECTURE
 
 ```
 玩家聊天 ──▶ play.js ──写──▶ chat_in.jsonl ──▶ mc_bridge.py ──调用模型──▶ cmd.txt
@@ -378,11 +384,17 @@ skins/                皮肤生成与渲染脚本
 mc_usage/             用量账本（按天生成，运行时产物；供 AstrBot「余额」插件读取）
 ```
 
-## 常见问题
+## 问答 · FAQ
 
 **Q：它是干什么的？和普通的挂机机器人有什么区别？**
 它更像一个“住在服务器里的玩家”：会聊天、跟着你走、帮你采集和建造、陪你打怪，
 没人指挥的时候也会自己找点事做（逛逛、修整、收拾东西）。它不是为了刷资源存在的。
+
+**Q：和 Mindcraft 那类项目有什么区别？**
+Mindcraft 更适合「自己开个世界，看 AI 在里面折腾」，它围绕局域网世界、会写代码、能看画面。
+这个项目更适合「已经有一个常驻服务器，想让它多一个长期在线的玩家」：
+面向离线服务器 + EasyAuth 登录，自带重连、重生、防 AFK、看门狗，
+玩家用聊天框说话就能指挥，不需要额外装 Python，接不接 AstrBot 也由你选。
 
 **Q：我需要记指令吗？**
 不用。在聊天框里正常说话就行，比如「过来」「帮我搭个屋」「附近有箱子吗」，
@@ -421,11 +433,11 @@ mc_usage/             用量账本（按天生成，运行时产物；供 AstrBo
 它每次动手都会先看情况（位置、背包、附近有什么），失败会换方法；
 找不到东西时会先扫描周边，扫不到就告诉你“附近没有”或“区块没加载，走近点再扫”。
 
-## 贡献
+## 贡献 · CONTRIBUTING
 
 欢迎 Issue 与 Pull Request。提交信息建议使用 `feat:` / `fix:` / `docs:` / `chore:` 前缀，方便归类阅读。
 
-## 特别致谢
+## 致谢 · CREDITS
 
 - **[mineflayer](https://github.com/PrismarineJS/mineflayer)** 与 **[PrismarineJS](https://github.com/PrismarineJS)**：整个项目的连接、物理与寻路都建立在它们之上。
 - **[minecraft-data](https://github.com/PrismarineJS/minecraft-data)**：方块、配方与协议数据的来源。
@@ -436,7 +448,7 @@ mc_usage/             用量账本（按天生成，运行时产物；供 AstrBo
 - **[MaiBot](https://github.com/Mai-with-u/MaiBot)**：本项目的**设计思路参考** —— README 的章节组织、「最像而不是好」这套表达方式，都受了它启发。
   > 注：**仅**为项目设计思路参考，本项目不含 MaiBot 的任何代码，也不依赖它运行。
 
-## 注意事项
+## 注意事项 · NOTES
 
 > [!IMPORTANT]
 > 这是一个会自己走动的账号，请务必先和服务器管理员打过招呼再放它上线。

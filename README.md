@@ -70,9 +70,11 @@ _截图陆续补充中。_
 | 项目 | 要求 |
 | --- | --- |
 | Node.js | ≥ 18（实测 v24.18.0） |
-| Python | ≥ 3.8（仅桥接层与辅助脚本需要） |
+| Python | ≥ 3.8，**可选**（只有 `mc_bridge.py` 与 `mcscan.py` 等辅助脚本需要；用纯 Node 桥 `mc_bridge.js` 则完全不装） |
 | Minecraft | 1.21.11（可通过 `MC_VER` 调整） |
 | 依赖 | `mineflayer`、`mineflayer-pathfinder`、`minecraft-data` |
+
+> Python 只服务两处：`mc_bridge.py`（Python 版桥）和 `mcscan.py`（方块扫描）。`play.js` 本体、`mc_bridge.js`、`mc_ipc.js` 都是纯 Node，**一个 Python 都不用**。
 
 服务器默认使用离线身份 + EasyAuth（`/register`、`/login`）。
 

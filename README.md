@@ -144,6 +144,9 @@ Windows 上守护建议放「任务计划程序」里开机启动 `node launcher
 | `MC_GC_TRIM` | 220MB | 达到该用量先执行一次 GC |
 | `MC_AUTOHARVEST` | `1` | 建造时是否顺路采集材料 |
 | `MC_FORCE_SURVIVAL` | `1` | 上线若被切换为冒险模式，自动执行 `/gamemode survival` |
+| `MC_CHAT_PER_MIN` | `6` | 公屏每分钟最多说几句（`0` = 关掉限速）；所有发言都走这一个出口，超出的先排队，排不下就丢 |
+| `MC_CHAT_BURST` | `3` | 允许一口气连着说几句（突发额度，不占每分钟名额） |
+| `MC_CHAT_QUEUE` / `MC_CHAT_MAXWAIT` | `4` / `8000` | 超速后最多排队几句 / 排队最多等多久（毫秒），过时的话就不说了 |
 | `MC_USAGE_KEEP_DAYS` | `90` | 用量账本保留天数（`<=0` 表示不清理） |
 | `LLM_KEY` | 必填 | 大模型 API key，写在 `mc.env`；`llm.json` 里不写明文 |
 | `MC_LLM_SOURCE` | `auto` | 模型从哪来：`own` 只用 `llm.json` + `mc.env`（不装 AstrBot 就用这个），`astrbot` 只用 AstrBot 的配置，`auto` 自己的优先、没配 key 才去找 AstrBot |

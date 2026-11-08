@@ -481,6 +481,32 @@ def load_candidates():
     return own + astr
 
 
+def load_persona():
+    """人设可配置（不用改代码、不用重启）：每次生成回复前现读一次 mc.env。
+
+    优先级：MC_PERSONA_FILE 指向的文件 > MC_PERSONA 内联（\\n 还原成换行）> 内置默认。
+    文件路径写相对路径时，相对 mcbot/ 目录。
+    """
+    env = _file_env()
+    p = _pick(env, "MC_PERSONA_FILE")
+    if p:
+        path = p if os.path.isabs(p) else os.path.join(HERE, p)
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                txt = f.read().strip()
+            if txt:
+                return txt
+            log("人设文件是空的，先按内置的来：" + path)
+        except Exception as e:
+            log("读人设文件失败(%s)，先按内置的来：%s" % (str(e)[:60], path))
+    t = _pick(env, "MC_PERSONA")
+    if t:
+        one = t.replace("\\n", "\n").strip()
+        if one:
+            return one
+    return PERSONA
+
+
 def post_chat(msgs, tools=None, temp=0.95, max_tokens=200):
     """调一次模型，返回 (message_dict, pid)。带 tools 失败就退回纯文本。"""
     cands = load_candidates()
@@ -526,7 +552,10 @@ def post_chat(msgs, tools=None, temp=0.95, max_tokens=200):
 def brief_result(name, res):
     """把回执压成一句话喂回模型（scan 之类一次几百个坐标会撑爆上下文）。"""
     if not res.get("ok"):
-        return "失败：" + str(res.get("msg") or "")[:120]
+        txt = "失败：" + str(res.get("msg") or "")[:120]
+        if res.get("note"):
+            txt += " " + str(res["note"])
+        return txt
     ex = res.get("extra") or {}
     if name == "scan":
         items = ex.get("list") or []
@@ -551,7 +580,7 @@ def brief_result(name, res):
 
 def gen_reply(user, msg, history, notes=None, pending=None):
     """生成回复；模型可以调工具在游戏里干活。返回 (文本, pid, 动作记录)"""
-    msgs = [{"role": "system", "content": PERSONA}]
+    msgs = [{"role": "system", "content": load_persona()}]
     if notes:
         msgs.append({"role": "system", "content":
                      "（你刚替他们干完的活儿，别重复干，随口提一句就行）\n- " + "\n- ".join(notes[-3:])})
@@ -673,6 +702,13 @@ def write_cmd(text, wait=10.0):
     return write_raw("说 " + text, wait)
 
 
+# "没回信"和"干完了但啥也没有"是两码事。不写清楚模型就会演成"附近24格没扫到箱子"，
+# 谎话和实话在她嘴里长一个样 —— 所以回执里直接把这句塞给模型，不给它自由发挥的余地。
+NO_REPLY_NOTE = ("（这只是没收到回信，不是干完了、也不是扫过没东西；"
+                 "别把没发生的结果当成结论说出来，如实说没回信就行）")
+NO_SEND_NOTE = "（这条命令根本没送到游戏，什么都没发生，别当成做过了）"
+
+
 def send_action(name, args=None, timeout=None, who=None, pending=None):
     """把动作发给 play.js，等它回执（act_out.json 里 id 对上）。
 
@@ -680,6 +716,14 @@ def send_action(name, args=None, timeout=None, who=None, pending=None):
     由 poll_async() 后续轮询 act_out.json，干完了补一句话 —— 这就是异步回报。
     """
     args = args or {}
+    # 同一件活儿已经在挂起队列里跑着 → 别再发一遍（真服务器上会白干两遍）
+    if pending:
+        now0 = time.time()
+        for _aid0, _p0 in pending.items():
+            if (_p0.get("name") == name and _p0.get("args") == args
+                    and now0 - float(_p0.get("ts") or 0) < ASYNC_TTL):
+                return {"ok": True, "async": True,
+                        "msg": "这件事已经在干了，别重复发，干完我跟你说"}
     if timeout is None:
         timeout = 8.0 if name in FAST_ACTIONS else 32.0
         if name == "pvp":   # 对打要等打完（默认 30s，最长 120s）
@@ -687,7 +731,8 @@ def send_action(name, args=None, timeout=None, who=None, pending=None):
     aid = "%d" % (int(time.time() * 1000) % 10 ** 11)
     line = "ACT " + json.dumps({"id": aid, "name": name, "args": args}, ensure_ascii=False)
     if not write_raw(line, wait=min(10.0, timeout)):
-        return {"ok": False, "msg": "游戏那边命令通道忙着，没发出去"}
+        return {"ok": False, "msg": "游戏那边命令通道忙着，没发出去",
+                "note": NO_SEND_NOTE}
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -698,12 +743,13 @@ def send_action(name, args=None, timeout=None, who=None, pending=None):
         except Exception:
             pass
         time.sleep(0.15)
-    # 命令确实送到游戏了，只是活儿没干完 → 挂起，等 dry 完再回报
-    if pending is not None:
+    # 命令确实送到游戏了，只是活儿没干完 → 挂起，等干完再回报
+    # 轻动作（看背包、看一眼这类）超时就是没回信，不值得后面再补一句话
+    if pending is not None and name not in FAST_ACTIONS:
         pending[aid] = {"name": name, "args": args, "who": who or "?", "ts": time.time()}
         log("ASYNC pending %s %s (等 %ss 未完成)" % (name, aid, int(timeout)))
-        return {"ok": True, "async": True, "msg": "活儿还没干完，先记着"}
-    return {"ok": False, "msg": "动作超时没回信：%s" % name}
+        return {"ok": True, "async": True, "msg": "活儿已经派人去干了，别重复发，干完我说一声"}
+    return {"ok": False, "msg": "动作超时没回信：%s" % name, "note": NO_REPLY_NOTE}
 
 
 def make_async_line(p, rec):

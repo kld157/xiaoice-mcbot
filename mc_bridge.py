@@ -179,6 +179,11 @@ TOOLS = [
             "note": {"type": "string", "description": "备注，如「木头小屋」「露天水塘」"},
             "x": {"type": "number", "description": "可选：不记当前位置，改记这个坐标"}, "y": {"type": "number"}, "z": {"type": "number"}}}}},
     {"type": "function", "function": {
+        "name": "death", "description": "死亡找回（分级判断，不瞎跑）。op=last 看上次死在哪、值不值得回去捡；list 最近几次死亡；recover 立刻去捡（默认只去判定划算的，force=true 硬去）；on/off 开关死后自动去捡。岩浆/虚空/死得太深/太远/来不及都会判「不去」，别硬来。",
+        "parameters": {"type": "object", "properties": {
+            "op": {"type": "string", "description": "last(默认) / list / recover / on / off"},
+            "force": {"type": "boolean", "description": "op=recover 时，判定为「不去」也硬去"}}}}},
+    {"type": "function", "function": {
         "name": "goal", "description": "跨轮目标：长任务先挂个目标，之后每轮 perceive 都会带在身上，聊两句也不会忘。op=set 设目标（可带 steps 步骤数组）；op=step 打勾一步；op=done 收尾；op=clear 放弃；默认 status 看进度。",
         "parameters": {"type": "object", "properties": {
             "op": {"type": "string", "description": "set / step / done / clear / status"},
@@ -249,7 +254,7 @@ ASYNC_CN = {
     "attack": "打怪", "pvp": "对打", "eat": "吃东西", "drink": "喝东西", "chest": "翻箱子",
     "sleep": "睡了一觉", "trade": "做买卖", "ride": "找载具", "toss": "扔东西", "place": "放方块",
     "pickup": "捡东西", "armor": "穿装备", "junk": "整理背包", "give": "递东西", "need": "备料",
-    "waypoint": "记路标", "rescue": "去救人", "autopilot": "自动跑", "gravel_fill": "填坑",
+    "waypoint": "记路标", "death": "回去捡东西", "rescue": "去救人", "autopilot": "自动跑", "gravel_fill": "填坑",
     "weapons": "换武器", "potions": "喝药水", "blueprint": "画图纸", "redstone": "摆红石",
 }
 

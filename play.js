@@ -901,7 +901,32 @@ const swimIntent = () => Date.now() < SWIM.until;
 // 事故点黑名单：溺水/摔死的地方记下来，别让自主行动又把孩子送回同一个坑
 const DANGER = { spots: [] };
 let lastKick = '';
+// 最近几句公屏：death.js 判断"值不值得跑回去捡"时会给模型看，别问它凭空猜
+const RECENT_CHAT = [];
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ---------- 死亡找回：逻辑全在 death.js，这里只接线 ----------
+const DEATH = require('./death.js').create({
+  getBot: () => bot,
+  log, say, sleep, Vec3,
+  hostiles, mobName, walkTo, pickUpNearby, autoArmor, equipBestWeapon, invTotalCount, noteEvent,
+  isBusy: () => !!(BUILD.active || COMBAT.active || followTarget || PVP.active) || !!loadGoal(),
+  addDanger: (spot) => { DANGER.spots.push(spot); while (DANGER.spots.length > 6) DANGER.spots.shift(); },
+  atomicWrite: (f, o) => PLAT.writeJsonAtomic(f, o, { space: 2 }),
+  file: path.join(__dirname, 'death.json'),
+  // 灰区判断用的模型通道：借"说话"那条（快、便宜、不思考），超时很快，等不到就算了
+  askModel: async (sys, user) => {
+    if (!LLM_CFG) throw new Error('模型没配');
+    const r = await LLM.chat(LLM_CFG, 'say', [
+      { role: 'system', content: sys },
+      { role: 'user', content: user },
+    ], { timeoutMs: 5000, max_tokens: 120, dir: __dirname });
+    if (!r.ok) throw new Error(r.err || '模型没回话');
+    return String(r.text || '');
+  },
+  recentChat: () => RECENT_CHAT.slice(-10),
+  goalText: () => { const g = loadGoal(); return g ? (g.text || '') : ''; },
+});
 
 // 挑材料：优先木板/原木，其次石头类，最后土类
 const MAT_PREF = [
@@ -3820,6 +3845,7 @@ function create() {
   bot.on('chat', (username, message) => {
     log(`<${username}> ${message}`);
     if (username === NAME) return;
+    try { RECENT_CHAT.push(`${username}: ${String(message).slice(0, 60)}`); if (RECENT_CHAT.length > 20) RECENT_CHAT.shift(); } catch (e) {}
     try { if (IPC) IPC.pushChat(username, message); } catch (e) {}
     handleChat(username, message);
   });
@@ -3853,29 +3879,35 @@ function create() {
     } catch (err) {}
   });
 
-  bot.on('death', () => {
+  bot.on('death', async () => {
+    const t0 = Date.now();
     deaths++;
-    const p = bot.entity ? bot.entity.position : null;
-    const why = bot.entity && bot.entity.isInWater ? '溺水' : (hostiles(10).length ? '被怪打' : '意外');
-    if (p) {
-      DANGER.spots.push({ x: p.x, y: p.y, z: p.z, why, t: Date.now() });
-      while (DANGER.spots.length > 6) DANGER.spots.shift();
-    }
+    const p = bot.entity ? bot.entity.position.clone() : null;
     DROWN.lastRescue = Date.now();
-    log('DIED #' + deaths + (p ? ' at ' + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ',' + p.z.toFixed(1) : '') + ' killers=[' + hostiles(10).map(e => e.name).join(',') + ']');
     stopFollow();
     COMBAT.active = false; COMBAT.target = null; COMBAT.cool = Date.now() + 1200;
     // 死了就别接着干活：之前 BUILD 循环不中断，重生后又被拉回同一片水连死 6 次
     BUILD.abort = true; BUILD.abortQuiet = true;
-    noteEvent(null, `我${why === '溺水' ? '淹死了' : why === '被怪打' ? '被怪打死了' : '意外死了'}，这是我第 ${deaths} 次死`, 0.75);
-    AUTO.pauseUntil = Math.max(AUTO.pauseUntil || 0, Date.now() + 8000);   // 重生后先愣 8 秒，别急着往回跑
+    AUTO.pauseUntil = Math.max(AUTO.pauseUntil || 0, Date.now() + 8000);   // 重生后先愣 8 秒
     try { bot.clearControlStates(); } catch (e) {}
     setTimeout(() => { try { bot.respawn(); } catch (e) {} }, 800);
+    // death.js：记账 + 分级判断 + 记危险点 + 排自动去捡
+    // 开了 MC_DEATH_LLM 时这里会多等模型 1~5 秒（灰区问"值不值"），所以话也往后顺延
+    let d;
+    try {
+      d = await DEATH.handleDeath(p);
+    } catch (e) {
+      log('DEATH 出错（照旧重生了，只是没记账）: ' + (e && e.message ? e.message : e));
+      d = { line: '我又死了一次……这次连死在哪都记不清了' };
+    }
+    const wait = Math.max(0, 2600 - (Date.now() - t0));
+    setTimeout(() => { try { say(d.line); } catch (e) {} }, wait);          // 活过来再说，别对着尸体喊
   });
 
   bot.on('health', () => {
     const d = (lastHp == null) ? 0 : lastHp - bot.health;
     if (d > 0.01) {
+      DEATH.noteHurt(d);   // 死的时候用来猜"是不是摔死的/砸死的"
       const p0 = bot.entity.position;
       const b = (dx, dy, dz) => { const bl = bot.blockAt(p0.offset(dx, dy, dz)); return bl ? bl.name : '?'; };
       log(`HURT -${d.toFixed(1)} hp=${bot.health} at ${p0.x.toFixed(1)},${p0.y.toFixed(1)},${p0.z.toFixed(1)} feet=${b(0,0,0)} head=${b(0,1,0)} below=${b(0,-1,0)} near=[${hostiles(8).map(e => e.name).join(',')}] inWater=${bot.entity.isInWater}`);
@@ -6016,6 +6048,8 @@ function wpBriefList(limit) {
   rows.sort((x, y) => (x.dist === null ? 1e9 : x.dist) - (y.dist === null ? 1e9 : y.dist));
   return rows.slice(0, limit || 12);
 }
+
+actRegister('death', (a) => DEATH.action(a));          // 死亡找回：last / list / recover / on / off
 
 actRegister('waypoint', async (a) => {
   if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };

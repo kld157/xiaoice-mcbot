@@ -17,6 +17,14 @@
  *   {t:'say', text:'...'}                        adapter 让我说话
  *   {t:'ping'} / {t:'pong'}                      探活
  *
+ * 后台拆分（brain.js）在这条通道上加的几条，互不干扰：
+ *   {t:'hello', role:'brain'}                    brain 报到，认人用
+ *   {t:'tools', names:[...]}                     play.js 回给 brain 的动作白名单
+ *   {t:'task', id, user, text, ctx}              play.js 把活儿交给 brain 想
+ *   {t:'batch', id, seq, items:[{name,args}]}    brain 一次发一批动作
+ *   {t:'batch_done', id, seq, results, aborted}  执行端回执（含每条的 ok/msg）
+ *   {t:'done', id, why}                          brain 说这活干完了
+ *
  * 这是个「锦上添花」的通道：任何异常都只 log，绝不 throw，
  * 不允许因为它把 play.js 主循环搞崩。
  */
@@ -27,9 +35,10 @@ const path = require('path');
 
 const DEFAULT_SOCK = path.join(__dirname, '.mc_ipc.sock');
 
-function attach({ log = console.log, onSay = null, sockPath = null } = {}) {
+function attach({ log = console.log, onSay = null, onBatch = null, onHello = null, sockPath = null } = {}) {
   const SOCK = sockPath || process.env.MC_IPC_SOCK || DEFAULT_SOCK;
   const clients = new Set();
+  const brains = new Set();   // 报到过的 brain.js 连接
   let server = null;
   let closed = false;
   let hbTimer = null;
@@ -67,6 +76,23 @@ function attach({ log = console.log, onSay = null, sockPath = null } = {}) {
       case 'ping':
         send(client, { t: 'pong', ts: Date.now() });
         break;
+      // brain.js 报到：记下来，顺手把动作白名单回给他（通用调用，白名单只此一份）
+      case 'hello':
+        if (obj.role === 'brain') {
+          brains.add(client);
+          log('IPC brain 接入（当前 ' + brains.size + ' 个）');
+          if (onHello) { try { onHello(obj, client); } catch (e) { log('IPC onHelloErr: ' + (e.message || e)); } }
+        }
+        break;
+      case 'batch':
+      case 'done':      // brain 说这活干完了，交给同一个回调（play.js 侧只管收尾）
+        if (onBatch) {
+          try { onBatch(obj); } catch (e) { log('IPC onBatchErr: ' + (e.message || e)); }
+        }
+        break;
+      case 'batch_done':
+        // 这个方向是 play.js -> brain，play.js 自己收到就当噪声丢掉
+        break;
       default:
         break;
     }
@@ -97,7 +123,7 @@ function attach({ log = console.log, onSay = null, sockPath = null } = {}) {
         }
       });
       client.on('error', (e) => log('IPC clientErr: ' + (e.message || e)));
-      client.on('close', () => clients.delete(client));
+      client.on('close', () => { clients.delete(client); brains.delete(client); });
       log('IPC adapter 接入（当前 ' + clients.size + ' 个）');
       if (READY_INFO) send(client, READY_INFO);
     });
@@ -139,6 +165,7 @@ function attach({ log = console.log, onSay = null, sockPath = null } = {}) {
     hbTimer = null;
     for (const c of clients) { try { c.destroy(); } catch (e) {} }
     clients.clear();
+    brains.clear();
     try { if (server) server.close(); } catch (e) {}
     server = null;
     try { fs.unlinkSync(SOCK); } catch (e) {}
@@ -149,6 +176,14 @@ function attach({ log = console.log, onSay = null, sockPath = null } = {}) {
     stop,
     sockPath: SOCK,
     clientCount: () => clients.size,
+    hasBrain: () => brains.size > 0,
+    // 通用下行：给 brain 发 task / batch_done / tools，不另造通道
+    push(obj) {
+      try { broadcast(Object.assign({ ts: Date.now() }, obj)); } catch (e) { log('IPC pushErr: ' + (e.message || e)); }
+    },
+    pushToBrain(obj) {
+      for (const c of brains) send(c, Object.assign({ ts: Date.now() }, obj));
+    },
     pushChat(user, msg) {
       broadcast({ t: 'chat', user: String(user).slice(0, 40), msg: String(msg).slice(0, 300), ts: Date.now() });
     },

@@ -29,6 +29,9 @@ const IS_WIN = P.IS_WIN;
 const BOT_KEYWORD = 'play.js';
 const BRIDGE_KEYWORD = 'mc_bridge.py';
 const BRIDGE_SCRIPT = path.join(HERE, BRIDGE_KEYWORD);
+// 后台大脑：跟 play.js 走同一条 socket 通道，play.js 不在它就只连着重试，不吃资源
+const BRAIN_KEYWORD = 'brain.js';
+const BRAIN_SCRIPT = path.join(HERE, BRAIN_KEYWORD);
 const PIDFILE = path.join(HERE, 'watchdog.pid');
 const LOCKFILE = path.join(HERE, '.play.lock');
 const WATCHLOG = path.join(HERE, 'watchdog.log');
@@ -203,6 +206,15 @@ function spawnBridge() {
   return spawnDetached(PY, [BRIDGE_SCRIPT]);
 }
 
+/** MC_BRAIN=0 时彻底不起大脑（退回 play.js 里的老流程） */
+function brainEnabled() {
+  return String(process.env.MC_BRAIN || '') !== '0';
+}
+
+function spawnBrain() {
+  return spawnDetached(process.execPath, [BRAIN_SCRIPT]);
+}
+
 function nowIso() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
@@ -232,6 +244,16 @@ async function cmdStart() {
   spawnBot();
   await P.sleep(1000);
   for (const p of findProcs(BOT_KEYWORD, ['node', 'node.exe'])) console.log(`started pid ${p.pid}`);
+
+  // 大脑先重启：它断线会自己重连，重启也没副作用，顺手保证用的是最新代码
+  if (brainEnabled()) {
+    for (const p of findProcs(BRAIN_KEYWORD, ['node', 'node.exe'])) killProc(p.pid, false);
+    await P.sleep(300);
+    spawnBrain();
+    console.log('brain (后台拆分) 已拉起');
+  } else {
+    console.log('MC_BRAIN=0，后台大脑不启用（走 play.js 本地流程）');
+  }
 
   // 顺手把守护带起来：没有才起，有就跳过（重复起虽然被锁挡着，但会多一个白跑的进程）。
   // 顺序讲究——先起 bot 再起守护，守护上来就看到 bot 活着，不会误判成「bot 挂了」又拉一个。
@@ -267,6 +289,11 @@ function cmdStop(a) {
       if (killProc(p.pid, false)) console.log(`bridge stopped pid ${p.pid}`);
     }
   }
+  if (a && a.brain) {
+    for (const p of findProcs(BRAIN_KEYWORD, ['node', 'node.exe'])) {
+      if (killProc(p.pid, false)) console.log(`brain stopped pid ${p.pid}`);
+    }
+  }
   return 0;
 }
 
@@ -276,12 +303,14 @@ function cmdStatus() {
   const env = loadEnv(path.join(HERE, 'mc.env'));
   const bot = findProcs(BOT_KEYWORD, ['node', 'node.exe']);
   const br = findProcs(BRIDGE_KEYWORD, ['python', 'python3', 'python.exe', 'python3.exe']);
+  const bn = findProcs(BRAIN_KEYWORD, ['node', 'node.exe']);
   const wd = watchdogProcs();
   const legacyWd = wd.filter((p) => !/launcher\.js/.test(p.cmd));
 
   console.log(`平台      : ${IS_WIN ? 'Windows' : process.platform}`);
   console.log(`play.js   : ${bot.length ? '运行中 pid ' + bot.map((p) => p.pid).join(',') : '未运行'}`);
   console.log(`mc_bridge : ${br.length ? '运行中 pid ' + br.map((p) => p.pid).join(',') : '未运行'}`);
+  console.log(`brain     : ${bn.length ? '运行中 pid ' + bn.map((p) => p.pid).join(',') : (brainEnabled() ? '未运行' : '已关闭(MC_BRAIN=0)')}`);
   console.log(
     `watchdog  : ${wd.length ? '运行中 pid ' + wd.map((p) => p.pid).join(',') : '未运行'}` +
       (legacyWd.length ? `（含遗留 bash 守护，建议 stop 后重开）` : '')
@@ -347,6 +376,13 @@ async function cmdWatchdog() {
       await P.sleep(5000);
     }
 
+    // 后台大脑：崩了没人补就是「小冰突然变笨」这种玄学故障，一起守
+    if (brainEnabled() && !findProcs(BRAIN_KEYWORD, ['node', 'node.exe']).length) {
+      log('watchdog: brain not running -> start');
+      spawnBrain();
+      await P.sleep(5000);
+    }
+
     await P.sleep(20000);
   }
 
@@ -359,7 +395,7 @@ async function cmdWatchdog() {
 
 function main() {
   const cmd = (process.argv[2] || '').toLowerCase();
-  const a = { bridge: process.argv.includes('--bridge') };
+  const a = { bridge: process.argv.includes('--bridge'), brain: process.argv.includes('--brain') };
   switch (cmd) {
     case 'start': return cmdStart();
     case 'stop': return cmdStop(a);
@@ -369,9 +405,9 @@ function main() {
       console.log(`用法: node launcher.js <start|stop|status|watchdog>
 
   start          重启 play.js（等价旧 start.sh）
-  stop           停掉 play.js，顺带停守护；--bridge 连 LLM 桥一起停
+  stop           停掉 play.js，顺带停守护；--bridge / --brain 连桥、后台大脑一起停
   status         谁在跑、锁干不干净
-  watchdog       常驻守护 play.js + mc_bridge.py（等价旧 watchdog.sh）`);
+  watchdog       常驻守护 play.js + mc_bridge.py + brain.js`);
       return cmd ? 2 : 0;
   }
 }

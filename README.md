@@ -21,7 +21,8 @@
 <a href="#架构">架构</a> ｜
 <a href="#常见问题">常见问题</a> ｜
 <a href="#特别致谢">致谢</a> ｜
-<a href="#注意事项">注意事项</a>
+<a href="#注意事项">注意事项</a> ｜
+<a href="#支持小冰">☕ 支持</a>
 
 </div>
 
@@ -132,8 +133,11 @@ node mc_bridge.js --once            # 只处理一次积压就退出（调试用
 node launcher.js start       :: 重启 bot，等价 sh start.sh
 node launcher.js watchdog    :: 常驻守护，等价 sh watchdog.sh
 node launcher.js status      :: 看谁在跑、锁干不干净
-node launcher.js stop        :: 停 bot，顺带停守护（--bridge 连桥一起停）
+node launcher.js stop        :: 停 bot，顺带停守护（--bridge / --brain 连桥、后台大脑一起停）
 ```
+
+`start` 会一起把后台大脑 `brain.js` 拉起来，`watchdog` 也守着它——它挂掉的表现是「小冰突然说话变笨」，
+不好排查，所以别让它自己躺着。不想用就 `MC_BRAIN=0`，play.js 立刻退回本地那套老流程。
 
 `start.sh` / `watchdog.sh` 现在是调 `launcher.js` 的薄壳，老命令照旧可用；逻辑只有一份，
 不会再出现「守护重启出来的 bot 和手动启动的 bot 行为不一样」这种事。
@@ -159,6 +163,11 @@ Windows 上守护建议放「任务计划程序」里开机启动 `node launcher
 | `MC_CHAT_PER_MIN` | `6` | 公屏每分钟最多说几句（`0` = 关掉限速）；所有发言都走这一个出口，超出的先排队，排不下就丢 |
 | `MC_CHAT_BURST` | `3` | 允许一口气连着说几句（突发额度，不占每分钟名额） |
 | `MC_CHAT_QUEUE` / `MC_CHAT_MAXWAIT` | `4` / `8000` | 超速后最多排队几句 / 排队最多等多久（毫秒），过时的话就不说了 |
+| `MC_DEATH_LLM` | `0` | 死后「这一趟值不值得跑回去捡」的灰区要不要问模型：`1` 开（规则说能去时再看一眼掉了什么、手头有没有活、有人拦没拦），`0` 纯规则。岩浆/虚空/别的维度/来不及 这些硬性判断永远走规则，模型只能否决 |
+| `MC_DEATH_LLM_TIMEOUT` | `5000` | 问模型最多等多久（毫秒，1000~15000）；超时就照规则办，不让一次死亡把聊天卡住 |
+| `MC_BRAIN` | `1` | 后台大脑开关（`brain.js`）：`1` 由 `launcher.js` 拉起并守护，`0` 不用它，play.js 走本地老流程 |
+| `MC_BATCH` / `MC_MAX_BATCH` | `3` / `12` | 大脑一批最多想几个动作 / 一个任务最多几批（防原地打转） |
+| `MC_BRAIN_KIND` | `auto` | 大脑走 `llm.json` 里的哪一档模型（`auto` / `main` / `cheap` 之类） |
 | `MC_USAGE_KEEP_DAYS` | `90` | 用量账本保留天数（`<=0` 表示不清理） |
 | `LLM_KEY` | 必填 | 大模型 API key，写在 `mc.env`；`llm.json` 里不写明文 |
 | `MC_LLM_SOURCE` | `auto` | 模型从哪来：`own` 只用 `llm.json` + `mc.env`（不装 AstrBot 就用这个），`astrbot` 只用 AstrBot 的配置，`auto` 自己的优先、没配 key 才去找 AstrBot |
@@ -167,20 +176,16 @@ Windows 上守护建议放「任务计划程序」里开机启动 `node launcher
 > **不装 AstrBot 也没问题**：模型只认 `llm.json`（走哪家、什么模型）+ `mc.env` 里的 `LLM_KEY`。
 > AstrBot 的配置只有在 `auto` 且自己没配 key、或 `MC_LLM_SOURCE=astrbot` 时才会被读。
 
-
 > `mc.env`、`llm.json`、日志、用量账本均已列入 `.gitignore`，仓库中只保留占位值；
 > 缺失 `MC_HOST` 时脚本会直接报错退出。
 
-### 5. 看花费（可选）：需要装「余额」插件
-
-> ⚠️ **说明：`astrbot_plugin_token_meter`（「余额预测（token 计费）」插件）未公开**，
-> 没有仓库地址、不在插件市场、也不对外分发，所以不要去找它。
-> 下面对它的描述只是说明「这份账本是给谁用的」，不影响本项目单独运行。
+### 5. 看花费（可选）
 
 账本 `mc_usage/YYYY-MM-DD.jsonl` 本身只是个文件，不会自己显示任何内容。想看「今天花了多少 / 余额还能撑几天」，
-本机是把它接进 AstrBot 的 **「余额预测（token 计费）」插件 —— `astrbot_plugin_token_meter`**
-（它的 `mc_source.py` 就是专门读这份 MC 账本的），再把插件配置里的 `mc_usage_path` 指向本目录的 `mc_usage`
-（填 `mcbot` 目录或 `mc_usage` 目录都可以）。
+作者是把它接进自用的 AstrBot「余额预测（token 计费）」插件来显示的 —— **该插件未公开**，
+没有仓库、不在插件市场，所以别去找它，这一段只是说明「这份账本是给谁用的」。
+
+接法：插件配置里的 `mc_usage_path` 指向本目录的 `mc_usage`（填 `mcbot` 目录或 `mc_usage` 目录都可以）。
 
 装好后直接在聊天里用：
 
@@ -192,6 +197,23 @@ Windows 上守护建议放「任务计划程序」里开机启动 `node launcher
 
 > 不装这个插件，bot 照样正常跑，只是没有账单界面。账本依然按天写入，超过 `MC_USAGE_KEEP_DAYS` 会自动清理；
 > 想自己看数的话，它只是一行一个 JSON（含模型名、输入/输出 token、时间），随手 `jq`/几行 Python 就能按天汇总。
+
+## 支持小冰
+
+先说清楚：**用这个项目不花钱**。模型走你自己填的 API Key（`mc.env` 里的 `LLM_KEY`），
+跑多久、烧多少 token 都是你自己的账，本项目不抽成，也没有任何付费环节。
+
+花钱的是「把她做出来」这件事。整个项目是在~~压力~~和 大肥鱼 友好交流的过程中一行行写出来的，
+改代码、调 bug、写文档&更新日志（虽然是我和bot抢着干），每一轮都要消耗 token。这份账单目前由作者自己扛着。
+
+如果你觉得她有点用，或者单纯想看她继续更新下去：
+
+- ☕ **爱发电**：<https://afdian.com/a/kld157>
+- ⭐ 点个 **Star** 也算支持 —— 它真的会让项目被更多需要的人看见
+- 🐛 提 Issue、交 PR、或者写一段使用体验发社交平台，同样对157很有价值
+
+> **功能不设付费墙**：本项目始终 MIT 开源，赞助纯粹是给157「续token」，
+> 不赞助也不会少任何功能。
 
 ## 使用方式
 
@@ -270,6 +292,7 @@ ACT {"id":"1","name":"goto","args":{"x":100,"y":64,"z":200}}
 | `craft` / `eat` / `pickup` / `armor` | 做把木剑 / 吃点东西 / 捡一下 / 换上护甲 |
 | `waypoint` | 把这儿记成家 / 走去矿洞口 / 我记了几个路标（名字存 `waypoints.json`） |
 | `goal` | 先把房子盖完 / 下一步 / 这步完了 / 目标取消（多步目标存 `goal.json`）；挂着目标时自主行动会自动拆步骤、推进度、卡住了重拆 |
+| `death` | 刚才死哪儿了 / 回去把东西捡回来 / 别自动去捡了（死因+坐标+判定存 `death.json`，岩浆·虚空·太深·太远·来不及都会判「不去」） |
 | `need` | 搓把钻石镐还缺啥 / 连箱子一起算（背包 + 箱子期初库存，对账后可清账） |
 | `build_house` / `build_status` | 给我搭个屋 / 盖到哪了 |
 | `pvp` / `attack` | 来打一架（收着打，血量低时认输） / 打怪 |
@@ -349,6 +372,7 @@ mcscan.register_chests(r=12, prefix='box')       # 登记容器，之后用 ches
 | 模块 | 职责 |
 | --- | --- |
 | `play.js` | 机器人本体：连接与重连、物理、寻路、动作注册表、自主行动循环、内存看门狗、文件指令通道 |
+| `death.js` | 死亡找回：记账（坐标/死因/背包）、分级判断「值不值得跑这一趟」、回去捡、同点反复死亡的教训 |
 | `mc_bridge.py` | 模型桥接：读取新聊天 → 拼接上下文与人格 → 调用模型 → 写回指令。成功回复会更新 `.bridge_heartbeat`，`play.js` 据此关闭本地闲聊规则以避免双回复，心跳过期则自动回退 |
 | `mc_bridge.js` | 同一个桥的纯 Node 实现：零依赖单文件，只靠 `fetch` 调模型，行为与 `mc_bridge.py` 一致（同样的人格、记忆、工具、限速与用量记账）。没 Python 环境就用它 |
 | `mc_ipc.js` | `play.js` 与本机 AstrBot「minecraft」平台适配器之间的 socket 通道，`MC_IPC_SOCK` 没配就自动跳过 |
@@ -358,18 +382,22 @@ mcscan.register_chests(r=12, prefix='box')       # 登记容器，之后用 ches
 
 ```
 play.js               机器人主体（动作、自主行动、巡检、看门狗）
+death.js              死亡找回（记账 / 判断值不值得回去 / 捡回来）
+llm.js                模型配置加载（llm.json + key 环境变量；own / astrbot / auto 三种来源）
 mc_bridge.py          模型桥接（对话 / 决策 / 用量记账 / 每日清理）
 mc_bridge.js          同上，纯 Node 版（零依赖单文件，没 Python 也能跑）
 mc_ipc.js             play.js 与 AstrBot minecraft 适配器的 socket 通道（可选）
 craft_engine.js       通用合成规划器（测试：test_craft_engine.js）
 mcscan.py             方块扫描封装（scan 动作的 Python 壳 + CLI + 容器登记）
+runact.py             命令行发单条动作（调试用，见上面 junk 的例子）
 memory.js             长期记忆流水（说话/事件留痕，检索后注入）
 important.js          重要记忆：事实 + 关系，按人分开注入
 memcli.js             重要记忆的查看 / 手改 CLI
 where.js              注册 / 登录并上报位置
 drift.js              registry 漂移检测（baseline / check）
 chunk_scan.js         区块 stateId 全量扫描，用于定位越界的 mod 方块
-launcher.js           跨平台启动/守护（start｜stop｜status｜watchdog），Windows 也认
+launcher.js           跨平台启动/守护（start｜stop｜status｜watchdog），Windows 也认；顺带守 brain.js
+brain.js              后台大脑：一批动作一起想、边做边生成下一批，复用 mc_ipc socket（MC_BRAIN=0 可关）
 start.sh              薄壳 → launcher.js start
 watchdog.sh           薄壳 → launcher.js watchdog
 install_mineflayer.sh 一键环境安装（幂等）
@@ -415,9 +443,9 @@ B 站上能看到的几类做法，按公开简介整理（细节以各自仓库
 - 单人视角。它自己玩自己的，不是多智能体协作，也没有团队调度。
 - 工程成熟度不如 Xinbot / Kilacraft。别人踩过的坑更多，出问题时能查的文档也更多。
 
-成本顺带说清楚：每个动作都过一次模型，账本记得明白——15 天 10550 次调用，输入 555 万 token
+成本顺带说清楚：每个动作都过一次模型，账本记得明白——实测 15 天 10550 次调用，输入 555 万 token
 （其中 355 万命中缓存）、输出 72 万，按实际账单算日均 2 块左右，15 天 30 块上下。
-挂着玩不心疼，但也不是白送；真正让人难受的还是速度。
+**这是你自己 key 的账单**，本项目不经手一分钱；挂着玩不心疼，但也不是白送——真正让人难受的还是速度。
 
 ## 常见问题
 

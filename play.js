@@ -196,6 +196,13 @@ if (process.env.MC_NATIVE !== '0') {
     IPC = MCIPC.attach({
       log,
       onSay: (text) => { try { say(String(text).slice(0, 240)); } catch (e) {} },
+      // brain.js 报到 → 把动作白名单回过去（通用调用：白名单只有 ACTIONS 这一份）
+      onHello: (obj) => {
+        log('BRAIN 接入 ' + JSON.stringify(obj).slice(0, 120));
+        try { IPC.pushToBrain({ t: 'tools', names: Object.keys(ACTIONS) }); } catch (e) {}
+      },
+      // 收批 / 收尾，全交给下面的 execBatch
+      onBatch: (obj) => { try { execBatch(obj); } catch (e) { log('BATCH ERR ' + (e.message || e)); } },
       sockPath: process.env.MC_IPC_SOCK || null,
     });
     IPC.start();
@@ -766,6 +773,14 @@ function handleChat(username, msg, internal) {
   // 归属 + 排队闸门（队列回放的指令 internal=true，不重复过闸）
   if (!internal && commandGate(username, body)) return;
 
+  // 后台拆分入口：动手类的活儿交给 brain.js 想，play.js 只负责执行
+  // brain 不在（没起 / 掉线）就自动退回原来的本地流程，不影响线上
+  if (BRAIN_ON && (intent ? intent.kind !== 'stop' : true) && brainTask(username, body)) {
+    taskBegin(username, 'cmd');
+    say(brainAck(username));
+    return;
+  }
+
   // 正在干活时的"免打扰"
   if (BUILD.active && !/^(停|停下|stop|别动|取消|停手|停一下)/i.test(body) && !/别(建|盖|造|搭)/.test(body)) {
     llmSay(`${sceneNow()}。${username}刚跟你说：「${body}」。你现在手上有活儿，回一句让他稍等，别太啰嗦。`, null, true);
@@ -901,7 +916,32 @@ const swimIntent = () => Date.now() < SWIM.until;
 // 事故点黑名单：溺水/摔死的地方记下来，别让自主行动又把孩子送回同一个坑
 const DANGER = { spots: [] };
 let lastKick = '';
+// 最近几句公屏：death.js 判断"值不值得跑回去捡"时会给模型看，别问它凭空猜
+const RECENT_CHAT = [];
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ---------- 死亡找回：逻辑全在 death.js，这里只接线 ----------
+const DEATH = require('./death.js').create({
+  getBot: () => bot,
+  log, say, sleep, Vec3,
+  hostiles, mobName, walkTo, pickUpNearby, autoArmor, equipBestWeapon, invTotalCount, noteEvent,
+  isBusy: () => !!(BUILD.active || COMBAT.active || followTarget || PVP.active) || !!loadGoal(),
+  addDanger: (spot) => { DANGER.spots.push(spot); while (DANGER.spots.length > 6) DANGER.spots.shift(); },
+  atomicWrite: (f, o) => PLAT.writeJsonAtomic(f, o, { space: 2 }),
+  file: path.join(__dirname, 'death.json'),
+  // 灰区判断用的模型通道：借"说话"那条（快、便宜、不思考），超时很快，等不到就算了
+  askModel: async (sys, user) => {
+    if (!LLM_CFG) throw new Error('模型没配');
+    const r = await LLM.chat(LLM_CFG, 'say', [
+      { role: 'system', content: sys },
+      { role: 'user', content: user },
+    ], { timeoutMs: 5000, max_tokens: 120, dir: __dirname });
+    if (!r.ok) throw new Error(r.err || '模型没回话');
+    return String(r.text || '');
+  },
+  recentChat: () => RECENT_CHAT.slice(-10),
+  goalText: () => { const g = loadGoal(); return g ? (g.text || '') : ''; },
+});
 
 // 挑材料：优先木板/原木，其次石头类，最后土类
 const MAT_PREF = [
@@ -922,6 +962,15 @@ function matList() {
 }
 function matScore(n) { for (const [re, s] of MAT_PREF) if (re.test(n)) return s; return 5; }
 function matCount() { return matList().reduce((s, i) => s + i.count, 0); }
+// 全背包按物品名计数（不信 boundingBox==='block' 那套过滤：coal/raw_iron 这类掉落物不是方块，
+// 只统计方块会让「挖了煤」在验收时看成「背包没变化」）
+function invCount() {
+  const o = {};
+  try {
+    for (const i of bot.inventory.items()) o[i.name] = (o[i.name] || 0) + i.count;
+  } catch (e) {}
+  return o;
+}
 function pickMat() { const m = matList(); return m.length ? m[0].name : null; }
 
 function groundTop(x, z, yRef) {
@@ -1239,28 +1288,134 @@ function planHouse(site, fromPos) {
 }
 
 // 材料不够就自己去挖土
-async function gather(need) {
+async function gather(need, only) {
+  const bare = (n) => String(n || '').toLowerCase().replace(/^minecraft:/, '').trim();
   const CAN = /^(dirt|grass_block|coarse_dirt|rooted_dirt|podzol|mycelium|sand|red_sand|gravel|clay|mud|snow_block)$/;
-  let got = 0, tried = 0;
-  // 只认"建房途中被叫停"，别让历史上残留的 BUILD.abort 把 collect 永久废掉（10-31 查出的 bug）
-  while (got < need && tried < 70 && !(BUILD.active && BUILD.abort)) {
-    if (!bot || !bot.entity) break;
+  // 指定方块就只挖那类（grass_block 挖掉掉 dirt，所以要一起认），别再随手挖个差不多的糊弄
+  const ALIAS = { dirt: ['dirt', 'grass_block', 'coarse_dirt', 'rooted_dirt', 'podzol', 'mycelium'], sand: ['sand', 'red_sand'], stone: ['stone', 'cobblestone', 'cobbled_deepslate'] };
+  const want = bare(only);
+  const allow = want ? new Set(ALIAS[want] || [want]) : null;
+  const okName = (n) => (allow ? allow.has(n) : CAN.test(n));
+  const watch = new Set(allow ? [...allow] : ['dirt', 'grass_block', 'sand', 'gravel', 'clay', 'snow_block']);
+  const countOf = () => { try { return (bot.inventory.items() || []).filter((i) => watch.has(bare(i.name))).reduce((s, i) => s + i.count, 0); } catch (e) { return 0; } };
+  const skipPos = new Set();   // 够不着/走不到的坐标，别反复试同一块
+  // 卡在洞里/被土包着：挖头顶 + 垫方块往上爬，出来再挖
+  const climbToOpen = async (steps = 6) => {
+    log('周围一块都够不着，先挖头顶往上爬');
+    for (let i = 0; i < steps; i++) {
+      if (!bot || !bot.entity) return false;
+      const pp = bot.entity.position.floored();
+      const b1 = bot.blockAt(pp.offset(0, 1, 0));
+      const b2 = bot.blockAt(pp.offset(0, 2, 0));
+      const blk = (b1 && b1.boundingBox === 'block') ? b1 : ((b2 && b2.boundingBox === 'block') ? b2 : null);
+      if (blk && blk.name !== 'bedrock') {
+        const before = countOf();
+        try { await equipBestFor(blk); await bot.dig(blk); } catch (e) { log('climb dig fail:' + (e.message || e)); }
+        await sleep(700);
+        if (!allow && countOf() > before) { got++; log(`climb 顺手挖到 ${blk.name}（${got}/${count}）`); }
+        if (allow || got >= count) return true;
+      } else {
+        const up = await pillarUp(1);
+        if (!up) { log('climb 没材料垫脚，放弃'); return false; }
+        await sleep(350);
+      }
+    }
+    return true;
+  };
+  // 就近扫一圈，找不到就扩大半径（以前只扫 ±8，站在石头平台上就以为"附近啥都没有"）
+  const scanNear = (r, dyLo, dyHi) => {
     const me = bot.entity.position;
     const bx = Math.floor(me.x), by = Math.floor(me.y), bz = Math.floor(me.z);
-    let best = null, bd = 9.5;
-    for (let dx = -8; dx <= 8; dx++) for (let dz = -8; dz <= 8; dz++) for (let dy = -6; dy <= 2; dy++) {
+    let best = null, bd = 1e9;
+    for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++) for (let dy = dyLo; dy <= dyHi; dy++) {
       const b = bot.blockAt(new Vec3(bx + dx, by + dy, bz + dz));
-      if (!b || !CAN.test(b.name)) continue;
+      if (!b || !b.name || !okName(bare(b.name))) continue;
+      if (b.boundingBox !== 'block') continue;
+      if (skipPos.has(`${b.position.x},${b.position.y},${b.position.z}`)) continue;
       const d = me.distanceTo(b.position);
       if (d < bd) { bd = d; best = b; }
     }
-    if (!best) break;
+    return best ? { b: best, d: bd } : null;
+  };
+  const findFar = (r) => {
+    let pts = [];
+    try {
+      pts = bot.findBlocks({ matching: (bl) => !!bl && !!bl.name && okName(bare(bl.name)) && bl.boundingBox === 'block', maxDistance: r, count: 64 }) || [];
+    } catch (e) { return null; }
+    const list = pts.map((p) => bot.blockAt(p)).filter((b) => b && b.name && okName(bare(b.name)) && b.boundingBox === 'block' && !skipPos.has(`${b.position.x},${b.position.y},${b.position.z}`));
+    if (!list.length) return null;
+    // 只挑"上面是空的"那种（露天的土），被埋在地里/头顶天花板的走过去也够不着
+    const exposed = list.filter((b) => { const a = bot.blockAt(b.position.offset(0, 1, 0)); return a && a.boundingBox === 'empty'; });
+    const pool = exposed.length ? exposed : list;
+    pool.sort((x, y) => {
+      const dx = x.position.distanceTo(bot.entity.position), dy = y.position.distanceTo(bot.entity.position);
+      const px = Math.abs(x.position.y - bot.entity.position.y), py = Math.abs(y.position.y - bot.entity.position.y);
+      return (dx + px * 1.5) - (dy + py * 1.5);
+    });
+    return pool[0];
+  };
+  let got = 0, tried = 0, noDrop = 0, walkMiss = 0;
+  // 只认"建房途中被叫停"，别让历史上残留的 BUILD.abort 把 collect 永久废掉（10-31 查出的 bug）
+  while (got < need && tried < 70 && !(BUILD.active && BUILD.abort)) {
+    if (!bot || !bot.entity) break;
+    // 先附近 8 格，再放宽到 16 格
+    let hit = scanNear(8, -6, 2) || scanNear(16, -8, 4);
+    if (!hit && allow) {
+      // 附近真没有：找 40 格内最近的同类方块，走过去挖（缺土的时候就得挪窝）
+      const far = findFar(40);
+      if (far) {
+        const fd = far.position.distanceTo(bot.entity.position);
+        log(`collect 附近没 ${want}，最近的 ${far.name}@${far.position} 有 ${fd.toFixed(1)} 格，走过去`);
+        await walkTo(far.position, 1.4, 20000, { dyTol: 4 });
+        if (far.position.distanceTo(bot.entity.position) > 5) {
+          walkMiss++; skipPos.add(`${far.position.x},${far.position.y},${far.position.z}`);
+          log(`走不到 ${far.position}（walkMiss=${walkMiss}）`);
+          if (walkMiss >= 3) { await climbToOpen(); walkMiss = 0; }
+        }
+        continue;
+      }
+      log(`collect 40 格内都没有 ${want}，不瞎挖了`);
+      break;
+    }
+    if (!hit) break;
+    const best = hit.b, bd = hit.d;
     tried++;
     try {
-      await walkTo(best.position, 2.4, 4000);
+      // 贴到方块正下/旁边再挖：这个服掉落物实体坐标读不准，站远了拾取不到（pickup 只会扑空）
+      if (bd > 1.8) await walkTo(best.position, 1.3, 8000, { dyTol: 4 });
+      const dd = bot.entity.position.distanceTo(best.position);
+      if (dd > 4.2) {
+        walkMiss++; skipPos.add(`${best.position.x},${best.position.y},${best.position.z}`);
+        log(`够不着 ${best.name}@${best.position}（${dd.toFixed(1)} 格），换一块`);
+        if (walkMiss >= 3) { walkMiss = 0; if (!(await climbToOpen())) break; }
+        continue;
+      }
+      const before = countOf();
+      await equipBestFor(best);
       await bot.dig(best);
-      got++;
-      if (got % 10 === 0) log(`gather ${got}/${need} mats=${matCount()}`);
+      await sleep(700);
+      let after = countOf();
+      // 1.21 服务器掉落物要飞一会儿才进包：没多就先手动捡两轮再判定
+      if (after <= before) {
+        for (let k = 0; k < 2 && after <= before; k++) {
+          try { await pickUpNearby(5, { force: true }); } catch (e) { log('pickup fail:' + (e.message || e)); }
+          await sleep(900);
+          after = countOf();
+        }
+      }
+      // 指定了方块就校验背包真的多了，别把"挖掉但什么都没拿到"算成成功
+      if (!allow || after > before) {
+        got++;
+        noDrop = 0;
+        log(`gather#${got} ${best.name}@${best.position} 背包 ${before}->${after}`);
+      } else {
+        noDrop++;
+        let still = '?';
+        try { const nb = bot.blockAt(best.position); still = nb ? nb.name : 'null'; } catch (e) {}
+        const items = Object.values(bot.entities).filter((e) => e && e.name === 'item').length;
+        log(`gather 挖了 ${best.name}@${best.position} 但背包没多（${before}->${after}），原地现在=${still}，距离=${bot.entity.position.distanceTo(best.position).toFixed(1)}，周围掉落物=${items}`);
+        if (noDrop >= 3) { log('gather 连续 3 次挖了不进包，先停'); break; }
+      }
     } catch (e) { log('digErr:' + (e.message || e)); break; }
   }
   log(`gather done got=${got} tried=${tried} mats=${matCount()}`);
@@ -1476,6 +1631,86 @@ async function runAction(line) {
 }
 
 actRegister('perceive', () => perceive());
+
+// ===== 后台拆分：brain.js 一次发一批动作，这里按序执行、边跑边回执 =====
+// 设计要点（对齐这次的四条）：
+//   · 一次一批：items 是数组，不是单条，省掉一轮一往返；
+//   · 一边生一边做：brain 在跑这批的同时已经生成下一批，执行端只留 1 个预取槽；
+//   · 通用调用：只查 ACTIONS 表，不新写分发；白名单也从这张表出；
+//   · 失败别滚雪球：某条挂了就停，回 aborted=true，让 brain 丢掉预取那批重想。
+const BRAIN_ON = process.env.MC_BRAIN !== '0';
+const BATCH = { id: null, seq: -1, busy: false, abort: false };
+
+async function execBatch(o) {
+  if (!o) return;
+  if (o.t === 'done') {                       // brain 收工
+    log(`BRAIN done ${o.id} ${o.why || ''}`);
+    if (BATCH.id === o.id) { BATCH.id = null; BATCH.seq = -1; BATCH.abort = false; }
+    taskEnd('brain-done');
+    return;
+  }
+  const id = String(o.id || '');
+  const seq = Number(o.seq || 0);
+  const items = Array.isArray(o.items) ? o.items.slice(0, 8) : [];
+  if (!items.length) return;
+  // 换了任务 / 有更新的批到了：老的批直接作废（预取槽只有 1 个）
+  if (BATCH.id && BATCH.id !== id) BATCH.abort = true;
+  if (seq <= BATCH.seq && BATCH.id === id) { log(`BATCH skip 旧的 seq=${seq}`); return; }
+  BATCH.id = id; BATCH.seq = seq; BATCH.abort = false;
+  log(`BATCH #${seq} ${items.length} 条 ` + items.map((x) => (x && x.name) || '?').join('>'));
+  const results = [];
+  let aborted = false;
+  for (let i = 0; i < items.length; i++) {
+    if (BATCH.abort || BATCH.id !== id) { aborted = true; break; }
+    const it = items[i] || {};
+    const name = String(it.name || it.action || '').trim();
+    const args = it.args || it.params || {};
+    const t0 = Date.now();
+    const fn = ACTIONS[name];
+    if (!fn) { results.push({ name, ok: false, msg: '没有这个动作（白名单里没有）', ms: 0 }); aborted = true; break; }
+    if (!ready) { results.push({ name, ok: false, msg: '还没进游戏', ms: 0 }); aborted = true; break; }
+    if (actBusy) { results.push({ name, ok: false, msg: '身体还在忙上一个动作', ms: 0 }); aborted = true; break; }
+    actBusy = true;                            // 一批里也是一件一件干，不并发
+    try {
+      log(`ACT ${name} ${JSON.stringify(args).slice(0, 160)}`);
+      const r = (await fn(args, id + ':' + seq + ':' + i)) || {};
+      const ok = r.ok !== false;
+      results.push({ name, ok, msg: String(r.msg || '').slice(0, 240), ms: Date.now() - t0 });
+      if (!ok) { aborted = true; break; }      // 第一条失败就收手，别把后面的照着错方向干完
+    } catch (e) {
+      log('ACT ERR ' + name + ' ' + ((e && e.stack) || e));
+      results.push({ name, ok: false, msg: '执行出错：' + (e && e.message ? e.message : e), ms: Date.now() - t0 });
+      aborted = true; break;
+    } finally { actBusy = false; }
+  }
+  try {
+    // inv：这一批做完之后的背包快照，brain 验收时用「背包真的变了吗」核对动作 ✓ 是不是假成功
+    IPC.pushToBrain({ t: 'batch_done', id, seq, results, aborted, inv: invCount() });
+  } catch (e) { log('BATCH 回执失败 ' + (e.message || e)); }
+  log(`BATCH DONE #${seq} aborted=${aborted} ` + results.map((r) => (r.ok ? '✓' : '✗') + r.name).join(' '));
+}
+
+// 把一条活儿交给后台想；brain 不在就返回 false，走原来的本地流程（老逻辑一行没动）
+function brainTask(user, text) {
+  if (!BRAIN_ON || !IPC || !IPC.hasBrain()) return false;
+  const id = 'b' + Date.now().toString(36);
+  let ctx = null;
+  try { ctx = perceive().extra || null; } catch (e) {}
+  BATCH.id = id; BATCH.seq = -1; BATCH.abort = false;
+  IPC.pushToBrain({ t: 'task', id, user, text, ctx, inv: invCount() });
+  log(`BRAIN task ${id} ${user}: ${String(text).slice(0, 80)}`);
+  return true;
+}
+
+// 接活儿时的一句口头应答（后台在想，得先给个声，别让人干等）
+function brainAck(user) {
+  return pick([
+    `${user}，好～我这就去办`,
+    '嗯，我想想怎么弄…',
+    '收到，等我一下下',
+    '这就动手，你稍等～',
+  ]);
+}
 
 // 诊断用：把附近所有水点的落差/岸边情况列出来（钓不到鱼时排障）
 actRegister('pathdiag', async (a) => {
@@ -1735,10 +1970,46 @@ function nearestDiggable(target, r = 3) {
   }
   return best;
 }
+// 按方块名找最近的几块（"dirt" / "oak_log" / "log" 都认）
+// 完全同名的优先，带后缀的（coarse_dirt、oak_log）往后排，这样别把粗泥巴当泥土
+function findBlocksByName(want, radius) {
+  const bare = (n) => String(n || '').toLowerCase().replace(/^minecraft:/, '').trim();
+  const w = bare(want);
+  if (!w) return [];
+  let pts = [];
+  try {
+    pts = bot.findBlocks({
+      matching: (bl) => { if (!bl || !bl.name) return false; const n = bare(bl.name); return n === w || n.endsWith('_' + w); },
+      maxDistance: radius, count: 96,
+    }) || [];
+  } catch (e) { log('findBlocksByName 出错 ' + (e.message || e)); return []; }
+  const me = bot.entity.position;
+  const out = [];
+  for (const p of pts) {
+    const bl = bot.blockAt(p);
+    if (!bl || bl.name === 'air' || bl.boundingBox !== 'block') continue;
+    const d = bl.position.distanceTo(me);
+    out.push({ bl, s: (bare(bl.name) === w ? 0 : 1000) + d });
+  }
+  out.sort((x, y) => x.s - y.s);
+  return out.map((x) => x.bl);
+}
+
 actRegister('dig', async (a) => {
   let b;
   const hasXYZ = (a.x !== undefined && a.y !== undefined && a.z !== undefined);
-  if (hasXYZ) b = bot.blockAt(new Vec3(Math.floor(+a.x), Math.floor(+a.y), Math.floor(+a.z)));
+  // ① 名字模式：模型说「挖三个泥土」时给的是 {block:"dirt"}
+  //    以前这参数被整个忽略，一路挖脚下 -> 要 dirt 结果挖到 cobblestone（2026-11-21 真机 bug）
+  //    现在按名字去找，找不到就老实报错，别偷偷挖个差不多的方块糊弄过去
+  const want = [a.block, a.name, a.what, a.type].find((x) => typeof x === 'string' && x.trim());
+  if (!hasXYZ && want) {
+    const cand = findBlocksByName(want, 8);
+    if (!cand.length) {
+      return { ok: false, msg: `附近 8 格内没找到 ${want}，得先走到有 ${want} 的地方，或者直接给我坐标` };
+    }
+    b = cand[0];
+    log(`DIG 按名字找 ${want} -> ${b.name} @${b.position}（候选 ${cand.length}）`);
+  } else if (hasXYZ) b = bot.blockAt(new Vec3(Math.floor(+a.x), Math.floor(+a.y), Math.floor(+a.z)));
   else {
     b = bot.blockAt(bot.entity.position.offset(0, -1, 0));
     // 脚下是空气（站在半空里、方块刚被自己挖掉）就别干瞪眼了，就近找一块能挖的
@@ -2433,9 +2704,16 @@ actRegister('surface', async () => {
 });
 actRegister('collect', async (a) => {
   const need = Math.max(1, Math.min(64, Math.round(+a.count || 16)));
+  // 指定方块（block/name/what）时只挖那类，比如 {block:"dirt"} 就别去挖石头
+  const only = [a.block, a.name, a.what, a.type].find((x) => typeof x === 'string' && x.trim()) || null;
   stopFollow();
-  const got = await gather(need);
-  return { ok: got > 0, msg: `挖到 ${got} 块，背包能当砖的有 ${matCount()} 块`, extra: { got, mats: matCount() } };
+  const got = await gather(need, only);
+  const tag = only ? ' ' + only : '';
+  return {
+    ok: got > 0,
+    msg: got > 0 ? `挖到 ${got} 块${tag}，背包能当砖的有 ${matCount()} 块` : `没挖到${tag || '能当砖的方块'}（附近没有，或者挖了没进背包）`,
+    extra: { got, mats: matCount(), block: only },
+  };
 });
 actRegister('cage', () => {
   if (!bot || !bot.entity) return { ok: false, msg: '还没连上' };
@@ -3820,6 +4098,7 @@ function create() {
   bot.on('chat', (username, message) => {
     log(`<${username}> ${message}`);
     if (username === NAME) return;
+    try { RECENT_CHAT.push(`${username}: ${String(message).slice(0, 60)}`); if (RECENT_CHAT.length > 20) RECENT_CHAT.shift(); } catch (e) {}
     try { if (IPC) IPC.pushChat(username, message); } catch (e) {}
     handleChat(username, message);
   });
@@ -3853,29 +4132,35 @@ function create() {
     } catch (err) {}
   });
 
-  bot.on('death', () => {
+  bot.on('death', async () => {
+    const t0 = Date.now();
     deaths++;
-    const p = bot.entity ? bot.entity.position : null;
-    const why = bot.entity && bot.entity.isInWater ? '溺水' : (hostiles(10).length ? '被怪打' : '意外');
-    if (p) {
-      DANGER.spots.push({ x: p.x, y: p.y, z: p.z, why, t: Date.now() });
-      while (DANGER.spots.length > 6) DANGER.spots.shift();
-    }
+    const p = bot.entity ? bot.entity.position.clone() : null;
     DROWN.lastRescue = Date.now();
-    log('DIED #' + deaths + (p ? ' at ' + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ',' + p.z.toFixed(1) : '') + ' killers=[' + hostiles(10).map(e => e.name).join(',') + ']');
     stopFollow();
     COMBAT.active = false; COMBAT.target = null; COMBAT.cool = Date.now() + 1200;
     // 死了就别接着干活：之前 BUILD 循环不中断，重生后又被拉回同一片水连死 6 次
     BUILD.abort = true; BUILD.abortQuiet = true;
-    noteEvent(null, `我${why === '溺水' ? '淹死了' : why === '被怪打' ? '被怪打死了' : '意外死了'}，这是我第 ${deaths} 次死`, 0.75);
-    AUTO.pauseUntil = Math.max(AUTO.pauseUntil || 0, Date.now() + 8000);   // 重生后先愣 8 秒，别急着往回跑
+    AUTO.pauseUntil = Math.max(AUTO.pauseUntil || 0, Date.now() + 8000);   // 重生后先愣 8 秒
     try { bot.clearControlStates(); } catch (e) {}
     setTimeout(() => { try { bot.respawn(); } catch (e) {} }, 800);
+    // death.js：记账 + 分级判断 + 记危险点 + 排自动去捡
+    // 开了 MC_DEATH_LLM 时这里会多等模型 1~5 秒（灰区问"值不值"），所以话也往后顺延
+    let d;
+    try {
+      d = await DEATH.handleDeath(p);
+    } catch (e) {
+      log('DEATH 出错（照旧重生了，只是没记账）: ' + (e && e.message ? e.message : e));
+      d = { line: '我又死了一次……这次连死在哪都记不清了' };
+    }
+    const wait = Math.max(0, 2600 - (Date.now() - t0));
+    setTimeout(() => { try { say(d.line); } catch (e) {} }, wait);          // 活过来再说，别对着尸体喊
   });
 
   bot.on('health', () => {
     const d = (lastHp == null) ? 0 : lastHp - bot.health;
     if (d > 0.01) {
+      DEATH.noteHurt(d);   // 死的时候用来猜"是不是摔死的/砸死的"
       const p0 = bot.entity.position;
       const b = (dx, dy, dz) => { const bl = bot.blockAt(p0.offset(dx, dy, dz)); return bl ? bl.name : '?'; };
       log(`HURT -${d.toFixed(1)} hp=${bot.health} at ${p0.x.toFixed(1)},${p0.y.toFixed(1)},${p0.z.toFixed(1)} feet=${b(0,0,0)} head=${b(0,1,0)} below=${b(0,-1,0)} near=[${hostiles(8).map(e => e.name).join(',')}] inWater=${bot.entity.isInWater}`);
@@ -5114,11 +5399,11 @@ const AUTO_MENU_LIST = [
   ['jump', '原地跳一下'],
   ['goto', '走到某个坐标，args: {x,y,z} 三个都要数字'],
   ['follow', '跟着玩家走一会儿，args: {player} 可省'],
-  ['dig', '挖掉一个方块，args: {x,y,z} 可省（省了就是正前方）'],
+  ['dig', '挖掉一个方块：args: {block:"方块名"}（在 8 格内找最近的那块，推荐）或者 {x,y,z} 坐标；block 找不到就报错，不会拿别的方块凑数'],
   ['place', '在某个位置放方块，args: {x,y,z, block} block 可省'],
   ['pillar', '脚下搭柱子上下，args: {dir:"up"或"down", count}'],
   ['surface', '从洞里挖出去回到地面'],
-  ['collect', '在附近采集能当砖的方块，args: {count}'],
+  ['collect', '在附近采集方块，args: {count, block?}；要泥土就传 {block:"dirt"}，不传 block 则采集任意能当砖的方块'],
   ['pickup', '把附近的掉落物捡了'],
   ['eat', '吃点背包里的东西垫肚子'],
   ['mobs', '列附近实体/动物（找吃的、找怪都用它），args: {range:64}'],
@@ -6016,6 +6301,8 @@ function wpBriefList(limit) {
   rows.sort((x, y) => (x.dist === null ? 1e9 : x.dist) - (y.dist === null ? 1e9 : y.dist));
   return rows.slice(0, limit || 12);
 }
+
+actRegister('death', (a) => DEATH.action(a));          // 死亡找回：last / list / recover / on / off
 
 actRegister('waypoint', async (a) => {
   if (!bot || !bot.entity) return { ok: false, msg: '我还没进服呢' };

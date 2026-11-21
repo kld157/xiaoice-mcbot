@@ -486,6 +486,20 @@ const TOOLS = [
   {
     "type": "function",
     "function": {
+      "name": "death",
+      "description": "死亡找回（分级判断，不瞎跑）。op=last 看上次死在哪、值不值得回去捡；list 最近几次死亡；recover 立刻去捡（默认只去判定划算的，force=true 硬去）；on/off 开关死后自动去捡。岩浆/虚空/死得太深/太远/来不及都会判「不去」，别硬来。",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "op": { "type": "string", "description": "last(默认) / list / recover / on / off" },
+          "force": { "type": "boolean", "description": "op=recover 时，判定为「不去」也硬去" }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "goal",
       "description": "跨轮目标：长任务先挂个目标，之后每轮 perceive 都会带在身上，聊两句也不会忘。op=set 设目标（可带 steps 步骤数组）；op=step 打勾一步；op=done 收尾；op=clear 放弃；默认 status 看进度。",
       "parameters": {
@@ -740,6 +754,7 @@ const ASYNC_CN = {
   "give": "递东西",
   "need": "备料",
   "waypoint": "记路标",
+  "death": "回去捡东西",
   "rescue": "去救人",
   "autopilot": "自动跑",
   "gravel_fill": "填坑",

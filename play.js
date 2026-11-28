@@ -148,8 +148,10 @@ function chatRefill() {
 }
 
 // 真正的发送（不限速）
+// 出口兜底：模型/玩家产出的文本一律当"说话"，绝不允许变成服务器命令。
+// 首字符的半角 / 和全角 ／ 一律剥掉（连空白也先吃掉），剥完是空的就不发。
 function rawSay(t) {
-  const m = String(t).slice(0, 240);
+  const m = String(t).slice(0, 240).replace(/^[\s\u3000]*[\/／]+/, '').trim();
   if (!bot || !bot.entity) { log('CHAT drop(未连接): ' + m.slice(0, 60)); return false; }
   log('SAY> ' + m);
   lastSpokeAt = Date.now();
@@ -3138,13 +3140,17 @@ function opCmd(cmd, ms = 2600) {
       },
     };
     const finish = (r) => { if (settled) return; settled = true; clearTimeout(timer); opPending.delete(w); resolve(r); };
-    const timer = setTimeout(() => finish({ ok: true, msg: 'no-reply' }), ms);
+    // 没回执 != 成功。原来这里直接 ok:true，等于"发没发出去都算给了"。
+    const timer = setTimeout(() => finish({ ok: false, msg: 'no-reply', timeout: true }), ms);
     opPending.add(w);
     try { bot.chat(cmd); } catch (e) { finish({ ok: false, msg: String((e && e.message) || e) }); }
   });
 }
-function opCheckMessage(t) {
+// pos 只认系统消息：mineflayer 里 game_info / system 是服务器说的，'chat' 是玩家说的。
+// 玩家在公屏打一句 "Done" 不该能冒充回执（原来是能冒充的）。
+function opCheckMessage(t, pos) {
   if (!opPending.size) return false;
+  if (pos === 'chat') return false;
   for (const w of opPending) { if (w.check(t)) return true; }
   return false;
 }
@@ -3163,12 +3169,13 @@ async function fairStart(target, opt) {
     ? `/effect give ${nm} ${o.effects[0][0]} ${o.effects[0][1]} ${o.effects[0][2]} true`
     : `/give ${nm} enchanted_golden_apple ${o.gapples}`;
   const probe = await opCmd(first, T + 600);
-  log(`FAIR probe ${first} -> ${probe.ok ? 'ok' : 'FAIL'} ${probe.msg}`);
-  if (!probe.ok) return { ok: false, msg: probe.msg || '没权限', gave };
+  log(`FAIR probe ${first} -> ${probe.ok ? 'ok' : probe.timeout ? 'unknown(当已发)' : 'FAIL'} ${probe.msg}`);
+  // 服务器不回执是常态，unknown 不判失败（否则每次公平开局都会误报"没权限"）
+  if (!probe.ok && !probe.timeout) return { ok: false, msg: probe.msg || '没权限', gave };
   gave.push({ who: nm, act: o.effects.length ? 'effect' : 'give', ef: o.effects.length ? o.effects[0][0] : undefined, item: o.effects.length ? undefined : 'enchanted_golden_apple', ok: true });
 
   // 剩下的对手那份 + 我自己那份并行发，省时间
-  const job = (who, cmd, tag) => opCmd(cmd, T).then((r) => Object.assign({ who, cmd, ok: r.ok, msg: r.msg }, tag));
+  const job = (who, cmd, tag) => opCmd(cmd, T).then((r) => Object.assign({ who, cmd, ok: r.ok, msg: r.msg, timeout: !!r.timeout }, tag));
   const jobs = [];
   if (Number(o.gapples) > 0) {
     jobs.push(job(nm, `/give ${nm} enchanted_golden_apple ${o.gapples}`, { act: 'give', item: 'enchanted_golden_apple', n: o.gapples }));
@@ -3182,9 +3189,10 @@ async function fairStart(target, opt) {
   const res = await Promise.all(jobs);
   for (const r of res) {
     gave.push(r);
-    log(`FAIR ${r.who} ${r.act}${r.ef ? ' ' + r.ef : ''}${r.item ? ' ' + r.item : ''} -> ${r.ok ? 'ok' : 'FAIL'} ${r.msg || ''}`);
+    log(`FAIR ${r.who} ${r.act}${r.ef ? ' ' + r.ef : ''}${r.item ? ' ' + r.item : ''} -> ${r.ok ? 'ok' : r.timeout ? 'unknown' : 'FAIL'} ${r.msg || ''}`);
   }
-  const bads = gave.filter((g) => !g.ok);
+  // 只有"明确被拒"才算失败；超时（服务器不回执）记在 logs 里，但不当失败
+  const bads = gave.filter((g) => !g.ok && !g.timeout);
   return {
     ok: bads.length === 0,
     msg: bads.length === 0
@@ -4166,10 +4174,10 @@ function create() {
   }, 5000);
   bot.once('end', () => clearInterval(sentinel));
 
-  bot.on('message', (m) => {
+  bot.on('message', (m, pos) => {
     const t = strip(m.toString());
     if (!t) return;
-    if (opCheckMessage(t)) return;   // 正在等 OP 指令回执（给东西/上效果），先别当闲聊处理
+    if (opCheckMessage(t, pos)) return;   // 正在等 OP 指令回执（给东西/上效果），先别当闲聊处理
     if (process.env.MSGDBG) log('MSG> ' + t.slice(0, 180));
     if (/registerRequired|Use \/register/i.test(t) && !registered) {
       registered = true;
@@ -6284,7 +6292,9 @@ actRegister('opcmd', async (a) => {
   const ms = Math.max(600, Math.min(6000, Number((a && a.ms) || 2500)));
   const full = cmd.startsWith('/') ? cmd : '/' + cmd;
   const r = await opCmd(full, ms);
-  return { ok: r.ok, msg: `${full} → ${r.ok ? '发出去了' : '失败'}（${r.msg}）`, extra: { cmd: full, reply: r.msg } };
+  // 超时也要说"发出去了"，否则模型会以为失败然后反复重发（白烧 token，还重复给东西）
+  const state = r.ok ? '发出去了' : r.timeout ? '发出去了（服务器没回执，不确定）' : '失败';
+  return { ok: r.ok || !!r.timeout, msg: `${full} → ${state}（${r.msg}）`, extra: { cmd: full, reply: r.msg, timeout: !!r.timeout } };
 });
 
 actRegister('potions', async () => {

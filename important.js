@@ -55,7 +55,7 @@ function normalize(o) {
     if (!f || !f.subject || !f.attr || !f.value) continue;
     d.facts.push({
       id: String(f.id || ('f' + d.facts.length)),
-      key: String(f.key || (f.subject + '|' + f.attr)).toLowerCase(),
+      key: String(f.key || mkKey(f.subject, f.attr, f.value)).toLowerCase(),
       type: f.type || 'fact',
       subject: String(f.subject),
       attr: String(f.attr),
@@ -72,7 +72,7 @@ function normalize(o) {
   const fmap = new Map();
   for (const f of d.facts) {
     f.attr = normAttr(f.attr);
-    f.key = (f.subject + '|' + f.attr).toLowerCase();
+    f.key = mkKey(f.subject, f.attr, f.value);
     const hit = fmap.get(f.key);
     if (!hit) { fmap.set(f.key, f); continue; }
     const [keep, drop] = (hit.ts || 0) >= (f.ts || 0) ? [hit, f] : [f, hit];
@@ -189,10 +189,21 @@ alias('喜欢', ['喜好', '爱好', '喜爱', '喜欢的东西', '最爱']);
 alias('名字', ['昵称', '外号', '称呼', '全名']);
 alias('工作', ['职业', '上班', '干什么的']);
 alias('身份', ['真实身份', '是谁']);
+// 「别这么干」也算长期信息：不是他是什么，是他不让你做什么。
+// 折成一个 attr，key 才对得上——同一个人说十来遍「别用圆石」，只该占一条。
+alias('禁忌', ['不许', '不准', '不要', '别', '禁止', '别做', '不能', '别再']);
 
 function normAttr(attr) {
   const t = clean(attr, 16) || '备注';
   return ATTR_ALIAS[t] || ATTR_ALIAS[t.replace(/的/g, '')] || t;
+}
+
+// 普通属性一个人只留一条（搬家就把旧家顶进 prev）；
+// 但「禁忌」天生可以有好几条——别用圆石、别动箱子是两件事，得把 value 也算进 key，
+// 不然第二条会把第一条顶掉，最后只记得最近那句。
+function mkKey(subject, attr, value) {
+  const base = String(subject || '') + '|' + String(attr || '');
+  return (attr === '禁忌' ? base + '|' + String(value || '') : base).toLowerCase();
 }
 
 // 关系同义词归一：好友 / 朋友 / 好朋友 是同一种，不然会存三条各说一遍
@@ -217,8 +228,9 @@ function addFact(f) {
   const value = scrubVal(clean(f.value, MAX_VALUE));
   if (!value) return null;
   if (isPrivate(attr, value)) { log(`现实信息不收：${subject}.${attr}=${value}`); return null; }
+  if (attr === '禁忌' && !banOn()) { log(`禁忌记忆没开（MC_MEM_BAN=1 才记），这条不收：${value}`); return null; }
 
-  const key = (subject + '|' + attr).toLowerCase();
+  const key = mkKey(subject, attr, value);
   const now = Number(f.ts) || Math.round(Date.now() / 1000);
   const exist = d.facts.find(x => x.key === key);
 
@@ -387,6 +399,7 @@ function block(who, budget) {
   const k = clean(who, 24).toLowerCase();
 
   const facts = d.facts.filter(f => {
+    if (f.attr === '禁忌' && !banOn()) return false;   // 开关关着：已存的禁忌也不往外吐
     const s = f.subject.trim();
     return (k && s.toLowerCase() === k) || GLOBAL_SUBJECTS.has(s) || GLOBAL_SUBJECTS.has(s.toLowerCase());
   });
@@ -394,7 +407,9 @@ function block(who, budget) {
   const rels = k ? d.relations.filter(r => r.a.toLowerCase() === k || r.b.toLowerCase() === k) : [];
   if (!facts.length && !rels.length) return '';
 
-  const rank = (x) => (x.confidence || 0.85) * 1.0 + Math.min(x.hits || 1, 5) * 0.06;
+  // 禁忌压过普通属性：宁可少说一句「他生日几号」，也不能反手把人家明令别干的事干一遍
+  const rank = (x) => (x.confidence || 0.85) * 1.0 + Math.min(x.hits || 1, 5) * 0.06 +
+    (x.attr === '禁忌' ? 0.35 : 0);
   facts.sort((a, b) => rank(b) - rank(a));
   rels.sort((a, b) => (b.ts || 0) - (a.ts || 0));
 
@@ -423,13 +438,29 @@ function block(who, budget) {
     const s = f.subject.trim();
     const global = GLOBAL_SUBJECTS.has(s) || GLOBAL_SUBJECTS.has(s.toLowerCase());
     // 是自己的事就说「你的」，比「小明的家」自然得多
-    if (!push('·' + (global ? `${f.attr}：${f.value}` : `你的${f.attr}：${f.value}`))) break;
+    // 禁忌单独成句：这是「他让你别做的事」，写成「你的禁忌：」会读反
+    const ban = f.attr === '禁忌';
+    const line = ban
+      ? (global ? `不许：${f.value}` : `${s} 不许你：${f.value}`)
+      : (global ? `${f.attr}：${f.value}` : `你的${f.attr}：${f.value}`);
+    if (!push('·' + line)) break;
   }
   if (!lines.length) return '';
   return head + lines.join('\n');
 }
 
 // ===== LLM 提炼 =====
+
+// 「禁忌记忆」开关：默认关。有人不喜欢被记规矩，或者怕记歪了天天被念。
+// 开：mc.env 里加 MC_MEM_BAN=1（也可以 setBan(true) 运行时切）
+// 关着的表现 = 压根没这个功能：不抽禁忌、不收禁忌、已存的也不往 prompt 里塞，其他记忆照旧
+let BAN = null;              // null = 没手动设过，去读环境变量
+function setBan(v) { BAN = (v === undefined || v === null) ? null : !!v; }
+function banOn() {
+  if (BAN !== null) return BAN;
+  const v = String(process.env.MC_MEM_BAN || '').trim().toLowerCase();
+  return v === '1' || v === 'on' || v === 'true' || v === 'yes';
+}
 
 // 粗筛：这几类话才值得花一次请求去提炼
 const HINT = new RegExp([
@@ -443,7 +474,15 @@ const HINT = new RegExp([
   '认识', '加个好友',
 ].join('|'));
 
-function looksImportant(t) { return HINT.test(String(t || '')); }
+// 否定型单独一份：开关关着就不进粗筛，也就不会有「禁忌」这种条目
+const BAN_HINT = new RegExp([
+  '别用', '别放', '别盖', '别挖', '别再', '别碰', '不要用', '不要放', '不许', '不准', '禁止',
+].join('|'));
+
+function looksImportant(t) {
+  const s = String(t || '');
+  return HINT.test(s) || (banOn() && BAN_HINT.test(s));
+}
 
 const EXTRACT_SYS = '你从 Minecraft 聊天里抽「值得长期记住」的信息，只输出 JSON，不要解释。\n' +
   '格式：{"facts":[{"subject":"小明","attr":"家","value":"主城东边红顶木屋 320,68,-112"}],"relations":[{"a":"小明","rel":"好友","b":"服主"}]}\n' +
@@ -462,6 +501,18 @@ const EXTRACT_SYS = '你从 Minecraft 聊天里抽「值得长期记住」的信
   '9. facts 的 value 不超过 20 字，别写整句。\n' +
   '10. 什么都没抽到就输出 {"facts":[],"relations":[]}。\n' +
   '11. 不许编，只抽话里真的说了的。';
+
+// 禁忌那套规则单独拼：开关关着就不进 prompt，模型连这个属性名都看不到
+const EXTRACT_BAN =
+  '1d. 有人明确「别 / 不要 / 不许」做某件事，也要抽：attr 写「禁忌」，value 只写那件事本身' +
+  '（如「用圆石糊墙」「动那只箱子」），subject 写提要求的人；分不清是谁提的、明显是对所有人说的，subject 写「世界」。\n';
+
+function extractSys() {
+  if (!banOn()) return EXTRACT_SYS;
+  return EXTRACT_SYS
+    .replace('2. 一次性的话', EXTRACT_BAN + '2. 一次性的话')
+    .replace('身份、备注', '身份、禁忌、备注');
+}
 
 // 模型经常裹 ```json 或者前后带解释，这里把第一个完整的 {...} 揪出来
 function pickJson(s) {
@@ -515,7 +566,7 @@ async function extract(player, text, force) {
   if (!body) return null;
   let raw;
   try {
-    raw = await EXTRACTOR({ player: player || '', text: body, sys: EXTRACT_SYS });
+    raw = await EXTRACTOR({ player: player || '', text: body, sys: extractSys() });
   } catch (e) {
     log('提炼失败：' + (e.message || e));
     return null;
@@ -547,5 +598,6 @@ module.exports = {
   isPrivate, scanPrivate, prunePrivate,
   extract, consider, applyExtracted, looksImportant, pickJson,
   isSym, scrubVal,
-  FILE, BAK, MAX_FACTS, MAX_RELS, BLOCK_BUDGET, EXTRACT_SYS,
+  FILE, BAK, MAX_FACTS, MAX_RELS, BLOCK_BUDGET, EXTRACT_SYS, extractSys,
+  banOn, setBan,
 };

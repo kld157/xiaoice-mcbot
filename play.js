@@ -152,6 +152,7 @@ function chatRefill() {
 // 首字符的半角 / 和全角 ／ 一律剥掉（连空白也先吃掉），剥完是空的就不发。
 function rawSay(t) {
   const m = String(t).slice(0, 240).replace(/^[\s\u3000]*[\/／]+/, '').trim();
+  if (!m) { log('CHAT drop(剥完为空)'); return false; }
   if (!bot || !bot.entity) { log('CHAT drop(未连接): ' + m.slice(0, 60)); return false; }
   log('SAY> ' + m);
   lastSpokeAt = Date.now();
@@ -765,7 +766,11 @@ function handleChat(username, msg, internal) {
   const raw = msg.trim();
   const low = raw.toLowerCase();
   // console 通道发来的 /命令 直接原样发给服务器（用于 /tp 等）
-  if (username === 'console' && /^\//.test(raw)) { log('SLASH> ' + raw); try { bot.chat(raw); } catch (e) {} return; }
+  if (username === 'console' && /^\//.test(raw)) {
+    // 调试口子：本机进程写一行 /命令 就能直发，默认关掉（要开：MC_CONSOLE_SLASH=1）
+    if (process.env.MC_CONSOLE_SLASH !== '1') { log('SLASH 忽略(未开 MC_CONSOLE_SLASH): ' + raw.slice(0, 80)); return; }
+    log('SLASH> ' + raw); try { bot.chat(raw); } catch (e) {} return;
+  }
   const mentioned = raw.includes(NAME) || /小冰/.test(raw);
   lastActivity = Date.now();
 
@@ -6286,10 +6291,28 @@ actRegister('drink', async (a) => {
 
 // 只看不喝：列出背包里的药水各是什么效果，方便决定喝哪个
 // 调试/自救口：直接发一条指令（默认只用来发物品、上效果、切模式，别乱来）
+// 管理类 / 不可逆命令拉黑：玩家怎么哄、模型怎么想，opcmd 都不发
+// 注意按「词」比对，所以 /execute run op xxx 这种套娃也会被 token 'op' 抓住
+const OP_DENY = new Set(('op deop ban ban-ip pardon pardon-ip kick stop whitelist '
+  + 'reload datapack function transfer setidletimeout save-off save-on save-all '
+  + 'debug execute permissions forceload').split(/\s+/).filter(Boolean));
+
 actRegister('opcmd', async (a) => {
   const cmd = String((a && (a.cmd || a.command)) || '').trim();
   if (!cmd) return { ok: false, msg: '要发什么指令？{"cmd":"/give @s potion 1"}' };
   const ms = Math.max(600, Math.min(6000, Number((a && a.ms) || 2500)));
+  const words = cmd.toLowerCase().split(/[\s\/]+/).filter(Boolean);
+  const hit = words.find((w) => OP_DENY.has(w));
+  if (hit) { log('OPCMD 拒绝(敏感): ' + cmd.slice(0, 80)); return { ok: false, msg: `这条不给发：${hit} 属于管理命令，小冰不碰` }; }
+  // 参数级：kill / clear 只许对自己下手，@a/@e/@r 一律不发
+  const pm = cmd.replace(/^[\/\s]+/, '').match(/^(kill|clear)\b\s*(.*)$/i);
+  if (pm) {
+    const target = (pm[2] || '').trim().split(/\s+/)[0] || '';
+    if (target && !/^@s$/i.test(target)) {
+      log('OPCMD 拒绝(范围): ' + cmd.slice(0, 80));
+      return { ok: false, msg: `/${pm[1]} ${target} 不给发：只许对自己（@s）下这条` };
+    }
+  }
   const full = cmd.startsWith('/') ? cmd : '/' + cmd;
   const r = await opCmd(full, ms);
   // 超时也要说"发出去了"，否则模型会以为失败然后反复重发（白烧 token，还重复给东西）
